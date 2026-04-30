@@ -42,14 +42,14 @@
 
 ## Screenshots
 
-> *Add screenshots / GIF here after first run*
+> *Screenshots coming soon.*
 
 ---
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/<your-username>/LucidLectorPDF.git
+git clone https://github.com/akinel-omur/LucidLectorPDF.git
 cd LucidLectorPDF
 pip install -r requirements.txt
 python main.py
