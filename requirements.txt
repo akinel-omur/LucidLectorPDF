@@ -1,0 +1,3 @@
+PyQt6>=6.6
+PyMuPDF>=1.24
+deep-translator>=1.11
