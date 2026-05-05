@@ -378,6 +378,9 @@ class MainWindow(QMainWindow):
         self._translation_panel.sentence_hovered.connect(self._view.show_hover_highlight)
         self._translation_panel.sentence_left.connect(self._view.clear_hover_highlight)
 
+        self._view.pdf_sentence_hovered.connect(self._translation_panel.highlight_sentence)
+        self._view.pdf_sentence_left.connect(self._translation_panel.clear_sentence_highlight)
+
         self._view.verticalScrollBar().valueChanged.connect(self._update_status)
         self._view.page_changed.connect(self._on_page_changed)
 
@@ -642,6 +645,7 @@ class MainWindow(QMainWindow):
     def _show_translation(self, original: str, translated: str) -> None:
         self._last_original = original          # remember for re-translate on lang change
         self._view.clear_hover_highlight()      # reset stale hover from previous translation
+        self._view.set_translation_context(original)
         self._translation_panel.set_content(original, translated)
         self._translation_dock.show()
         self._translation_dock.raise_()

@@ -140,6 +140,7 @@ class AutoscrollIndicator(QWidget):
 
 from .i18n import s as _s
 from .pdf_document import PdfDocument, Word
+from .translation_popup import _sentence_boundaries
 
 
 PAGE_GAP = 12  # pixels between pages in scene
@@ -168,6 +169,8 @@ class PdfView(QGraphicsView):
     underline_requested = pyqtSignal(int, list)  # page_index, list[fitz.Rect]
     delete_annotation_requested = pyqtSignal(int, object)  # page_index, (x, y)
     page_changed = pyqtSignal(int)
+    pdf_sentence_hovered = pyqtSignal(str)   # sentence text under cursor
+    pdf_sentence_left = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -204,6 +207,15 @@ class PdfView(QGraphicsView):
         self._eye_filter_color: QColor | None = None
         self._locale: str = "tr"
         self._hover_items: list[QGraphicsRectItem] = []
+        # PDF→panel hover: rects of every sentence in the active translation,
+        # keyed by sentence text so we can both detect hover and reuse rects
+        # for the on-PDF teal highlight without re-running search().
+        self._sentence_rects: list[tuple[int, fitz.Rect, str]] = []
+        self._last_pdf_hover_sentence: str = ""
+        # Always-on hover detection — required for mouseMoveEvent to fire
+        # without a button held down.
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
 
         # Autoscroll (middle-click joystick)
         self._autoscroll_anchor: QPoint | None = None
@@ -236,6 +248,8 @@ class PdfView(QGraphicsView):
         # Scene.clear() destroys these items; drop dangling Python refs too.
         self._paragraph_markers.clear()
         self._active_search_index = -1
+        self._sentence_rects.clear()
+        self._last_pdf_hover_sentence = ""
         if self.doc is not None:
             self.doc.close()
             self.doc = None
@@ -362,6 +376,72 @@ class PdfView(QGraphicsView):
             except RuntimeError:
                 pass
         self._hover_items.clear()
+
+    # ---------- PDF→panel sentence hover ----------
+    def set_translation_context(self, original: str) -> None:
+        """Cache rects for every sentence in *original* so that hovering text
+        on the PDF can drive the translation panel highlight."""
+        self._sentence_rects.clear()
+        self._last_pdf_hover_sentence = ""
+        if not original or self.doc is None:
+            return
+        for s, e in _sentence_boundaries(original):
+            sent = original[s:e].strip()
+            if len(sent) < 8:
+                continue
+            results = self.doc.search(sent)
+            if not results:
+                # Same fallback as show_hover_highlight: try the first 8 words.
+                words = sent.split()
+                if len(words) > 3:
+                    results = self.doc.search(" ".join(words[:8]))
+            for page_idx, rects in results.items():
+                for r in rects:
+                    self._sentence_rects.append((page_idx, r, sent))
+
+    def clear_translation_context(self) -> None:
+        self._sentence_rects.clear()
+        if self._last_pdf_hover_sentence:
+            self._last_pdf_hover_sentence = ""
+            self.clear_hover_highlight()
+            self.pdf_sentence_left.emit()
+
+    def _sentence_at_scene_point(self, scene_pt: QPointF) -> str | None:
+        if not self._sentence_rects:
+            return None
+        for page_idx, r, text in self._sentence_rects:
+            if page_idx >= len(self._pages):
+                continue
+            page = self._pages[page_idx]
+            if page is None:
+                continue
+            if self._pdf_rect_to_scene(page, r).contains(scene_pt):
+                return text
+        return None
+
+    def _update_pdf_hover(self, viewport_pos: QPoint) -> None:
+        """Drive the translation-panel highlight based on the cursor position."""
+        if not self._sentence_rects:
+            return
+        scene_pt = self.mapToScene(viewport_pos)
+        sentence = self._sentence_at_scene_point(scene_pt)
+        if sentence is None:
+            if self._last_pdf_hover_sentence:
+                self._last_pdf_hover_sentence = ""
+                self.clear_hover_highlight()
+                self.pdf_sentence_left.emit()
+            return
+        if sentence != self._last_pdf_hover_sentence:
+            self._last_pdf_hover_sentence = sentence
+            self.show_hover_highlight(sentence)   # teal overlay on PDF
+            self.pdf_sentence_hovered.emit(sentence)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802
+        if self._last_pdf_hover_sentence:
+            self._last_pdf_hover_sentence = ""
+            self.clear_hover_highlight()
+            self.pdf_sentence_left.emit()
+        super().leaveEvent(event)
 
     # ---------- eye-protection tint ----------
     def set_eye_filter(self, color: QColor | None) -> None:
@@ -699,6 +779,10 @@ class PdfView(QGraphicsView):
             self._update_selection(self._sel_anchor_scene, pos)
             event.accept()
             return
+        # Passive hover (no button pressed, not autoscrolling) drives the
+        # translation-panel sentence highlight.
+        if self._autoscroll_anchor is None:
+            self._update_pdf_hover(event.pos())
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:

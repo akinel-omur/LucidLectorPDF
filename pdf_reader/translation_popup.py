@@ -4,15 +4,19 @@ from __future__ import annotations
 import re
 
 from PyQt6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QGuiApplication, QPainter
+from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
+
+# Same teal as PdfView.HOVER_COLOR — keep both panes in sync visually.
+_HOVER_HIGHLIGHT_COLOR = QColor(50, 210, 180, 130)
 
 from .i18n import s as _s
 
@@ -42,6 +46,22 @@ def _sentence_at(text: str, pos: int) -> str:
         if start <= pos < end:
             return text[start:end].strip()
     return text.strip()   # fallback: whole text is one sentence
+
+
+def _sentence_index_of(text: str, target: str) -> int | None:
+    """Index (0-based) of the sentence in *text* whose stripped form equals *target*.
+    Falls back to the first sentence containing *target* as a substring."""
+    target = target.strip()
+    if not target:
+        return None
+    bounds = _sentence_boundaries(text)
+    for i, (s, e) in enumerate(bounds):
+        if text[s:e].strip() == target:
+            return i
+    for i, (s, e) in enumerate(bounds):
+        if target in text[s:e]:
+            return i
+    return None
 
 
 def _nth_sentence(text: str, n: int) -> str:
@@ -159,6 +179,51 @@ class TranslationPanel(QWidget):
         self._tr.setPlainText(translated)
         # Clear any lingering hover state when new content arrives.
         self._last_hover_sentence = ""
+        self.clear_sentence_highlight()
+
+    # ------------------------------------------------------------------ #
+    # External (PDF → panel) sentence highlighting
+    # ------------------------------------------------------------------ #
+    def highlight_sentence(self, sentence_text: str) -> None:
+        """Tint the matching sentence in both editors with the hover color."""
+        sentence_text = (sentence_text or "").strip()
+        if not sentence_text:
+            self.clear_sentence_highlight()
+            return
+        orig_text = self._orig.toPlainText()
+        idx = _sentence_index_of(orig_text, sentence_text)
+        if idx is None:
+            self.clear_sentence_highlight()
+            return
+        self._apply_sentence_highlight(self._orig, idx)
+        # Map to the same-index sentence in the translated text; if the
+        # translation has fewer sentences, use the closest available one.
+        tr_text = self._tr.toPlainText()
+        tr_bounds = _sentence_boundaries(tr_text)
+        if tr_bounds:
+            tr_idx = min(idx, len(tr_bounds) - 1)
+            self._apply_sentence_highlight(self._tr, tr_idx)
+        else:
+            self._tr.setExtraSelections([])
+
+    def clear_sentence_highlight(self) -> None:
+        self._orig.setExtraSelections([])
+        self._tr.setExtraSelections([])
+
+    @staticmethod
+    def _apply_sentence_highlight(editor: QPlainTextEdit, sentence_idx: int) -> None:
+        bounds = _sentence_boundaries(editor.toPlainText())
+        if not bounds or sentence_idx < 0 or sentence_idx >= len(bounds):
+            editor.setExtraSelections([])
+            return
+        s, e = bounds[sentence_idx]
+        sel = QTextEdit.ExtraSelection()
+        sel.format.setBackground(_HOVER_HIGHLIGHT_COLOR)
+        cursor = QTextCursor(editor.document())
+        cursor.setPosition(s)
+        cursor.setPosition(e, QTextCursor.MoveMode.KeepAnchor)
+        sel.cursor = cursor
+        editor.setExtraSelections([sel])
 
     def set_target_language(self, code: str) -> None:
         self._target_code = code
@@ -220,11 +285,13 @@ class TranslationPanel(QWidget):
 
         if sentence != self._last_hover_sentence:
             self._last_hover_sentence = sentence
+            self.highlight_sentence(sentence)
             self.sentence_hovered.emit(sentence)
 
     def _emit_leave(self) -> None:
         if self._last_hover_sentence:
             self._last_hover_sentence = ""
+            self.clear_sentence_highlight()
             self.sentence_left.emit()
 
     # ------------------------------------------------------------------ #
