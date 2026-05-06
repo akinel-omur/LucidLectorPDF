@@ -18,7 +18,7 @@
 
 <p align="center">
   <a href="https://github.com/akinel-omur/LucidLectorPDF/releases/latest/download/LucidLectorPDF.exe">
-    <img src="https://img.shields.io/badge/⬇%20Download%20.exe-v1.0.0-brightgreen?style=for-the-badge&logo=windows&logoColor=white"/>
+    <img src="https://img.shields.io/badge/⬇%20Download%20.exe-v1.1.0-brightgreen?style=for-the-badge&logo=windows&logoColor=white"/>
   </a>
 </p>
 
