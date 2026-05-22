@@ -44,16 +44,44 @@ from .translator import LANGUAGES, Translator
 
 
 class MainWindow(QMainWindow):
+    # ------------------------------------------------------------------ #
+    # Per-panel state helpers (route to whichever panel is currently active)
+    # ------------------------------------------------------------------ #
+    @property
+    def _current_path(self) -> "Path | None":
+        return self._panel_paths.get(id(self._active_view))
+
+    @_current_path.setter
+    def _current_path(self, val: "Path | None") -> None:
+        self._panel_paths[id(self._active_view)] = val
+
+    @property
+    def _document_dirty(self) -> bool:
+        return self._panel_dirty.get(id(self._active_view), False)
+
+    @_document_dirty.setter
+    def _document_dirty(self, val: bool) -> None:
+        self._panel_dirty[id(self._active_view)] = val
+
+    @property
+    def _undo_stack(self) -> list:
+        return self._undo_stacks.setdefault(id(self._active_view), [])
+
+    @property
+    def _redo_stack(self) -> list:
+        return self._redo_stacks.setdefault(id(self._active_view), [])
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LucidLectorPDF")
         self.resize(1100, 800)
 
         # Core state
-        self._current_path: Path | None = None
-        self._document_dirty = False
-        self._undo_stack: list[dict] = []
-        self._redo_stack: list[dict] = []
+        # Per-panel state (keyed by id(view)); initialised after _view is created
+        self._panel_paths: dict[int, "Path | None"] = {}
+        self._panel_dirty: dict[int, bool] = {}
+        self._undo_stacks: dict[int, list] = {}
+        self._redo_stacks: dict[int, list] = {}
         self._settings = QSettings("PdfReader", "App")
         self._highlight_color = self._load_color("highlightColor", "#FFEB3B")
         self._underline_color = self._load_color("underlineColor", "#E53935")
@@ -70,6 +98,12 @@ class MainWindow(QMainWindow):
         # Split-view support
         self._view2: PdfView | None = None
         self._active_view: PdfView = self._view   # whichever panel received the last click
+
+        # Initialise per-panel state for the primary view
+        self._panel_paths[id(self._view)] = None
+        self._panel_dirty[id(self._view)] = False
+        self._undo_stacks[id(self._view)] = []
+        self._redo_stacks[id(self._view)] = []
 
         container = QWidget(self)
         layout = QVBoxLayout(container)
@@ -571,21 +605,35 @@ class MainWindow(QMainWindow):
                 _s(self._locale, "dlg_open_err_msg").format(err=e),
             )
             return
-        self._view.load(doc)
-        if self._view2 is not None:
-            self._view2.load_shared(doc)
+        self._active_view.load(doc)
         self._current_path = Path(path)
         self._document_dirty = False
-        self._undo_stack.clear()
-        self._redo_stack.clear()
+        self._undo_stacks[id(self._active_view)].clear()
+        self._redo_stacks[id(self._active_view)].clear()
         self._update_undo_actions()
-        self.setWindowTitle(f"{self._current_path.name} — LucidLectorPDF")
+        self._update_title()
         self._page_input.setMaximum(doc.page_count)
         self._page_input.setValue(1)
         self._page_total_label.setText(f" / {doc.page_count}  ")
         self._recent.add(path)
         self._refresh_recent_menu()
         self._update_status()
+
+    def _update_title(self) -> None:
+        """Set window title to reflect currently open files in both panels."""
+        p1 = self._panel_paths.get(id(self._view))
+        if self._view2 is not None:
+            p2 = self._panel_paths.get(id(self._view2))
+            if p1 and p2:
+                self.setWindowTitle(f"{p1.name} | {p2.name} — LucidLectorPDF")
+                return
+            if p1:
+                self.setWindowTitle(f"{p1.name} — LucidLectorPDF")
+                return
+        if p1:
+            self.setWindowTitle(f"{p1.name} — LucidLectorPDF")
+        else:
+            self.setWindowTitle("LucidLectorPDF")
 
     def _refresh_recent_menu(self) -> None:
         self._recent_menu.clear()
@@ -655,6 +703,15 @@ class MainWindow(QMainWindow):
             self._view2.set_active_indicator(view is self._view2)
         self._sync_page_input()
         self._update_status()
+        self._update_undo_actions()
+        # Update total-pages label for the newly-active panel's doc
+        v = self._active_view
+        if v.doc is not None:
+            self._page_input.setMaximum(v.doc.page_count)
+            self._page_total_label.setText(f" / {v.doc.page_count}  ")
+        else:
+            self._page_input.setMaximum(1)
+            self._page_total_label.setText(" / 0  ")
 
     def _toggle_split(self, checked: bool) -> None:
         """Open or close the second panel next to the main view."""
@@ -695,14 +752,30 @@ class MainWindow(QMainWindow):
                 "karartma":  QColor(  0,   0,   0,  90),
             }
             v2.set_eye_filter(colors.get(self._current_eye_mode))
-            # Add to splitter and load shared document if one is open
+            # Initialise per-panel state for the new panel
+            self._panel_paths[id(v2)] = None
+            self._panel_dirty[id(v2)] = False
+            self._undo_stacks[id(v2)] = []
+            self._redo_stacks[id(v2)] = []
+            # Add to splitter and open the same file independently so docs are fully decoupled
             self._splitter.addWidget(v2)
             v2.show()
-            if self._view.doc is not None:
-                v2.load_shared(self._view.doc)
+            primary_path = self._panel_paths.get(id(self._view))
+            if primary_path is not None:
+                try:
+                    v2_doc = PdfDocument(str(primary_path))
+                    v2.load(v2_doc)
+                    self._panel_paths[id(v2)] = primary_path
+                except Exception:  # noqa: BLE001
+                    pass
+            self._update_title()
         else:
             if self._view2 is None:
                 return
+            self._panel_paths.pop(id(self._view2), None)
+            self._panel_dirty.pop(id(self._view2), None)
+            self._undo_stacks.pop(id(self._view2), None)
+            self._redo_stacks.pop(id(self._view2), None)
             self._view2.clear()
             self._view2.setParent(None)   # type: ignore[arg-type]
             self._view2.deleteLater()
@@ -712,6 +785,7 @@ class MainWindow(QMainWindow):
             self._view.set_active_indicator(True)
             self._sync_page_input()
             self._update_status()
+            self._update_title()
 
     def _rotate_pages(self, delta: int = 90) -> None:
         if self._view.doc is None:
@@ -781,10 +855,17 @@ class MainWindow(QMainWindow):
     # Annotations (highlight + underline)
     # ================================================================== #
     def _rerender_page(self, page_index: int) -> None:
-        """Re-render *page_index* in both panels (annotation changes need this)."""
-        self._view.rerender_page(page_index)
-        if self._view2 is not None:
-            self._view2.rerender_page(page_index)
+        """Re-render *page_index* in the active view.
+        Also mirrors to the other panel if both panels show the same file."""
+        self._active_view.rerender_page(page_index)
+        other = self._view2 if self._active_view is self._view else self._view
+        if (
+            other is not None
+            and other.doc is not None
+            and self._active_view.doc is not None
+            and str(other.doc.path) == str(self._active_view.doc.path)
+        ):
+            other.rerender_page(page_index)
 
     def _on_highlight(self, page_index: int, rects: list) -> None:
         self._add_annotation("highlight", page_index, rects)
@@ -793,11 +874,11 @@ class MainWindow(QMainWindow):
         self._add_annotation("underline", page_index, rects)
 
     def _create_annot(self, kind: str, pi: int, rects: list, color: tuple) -> int | None:
-        if self._view.doc is None:
+        if self._active_view.doc is None:
             return None
         if kind == "underline":
-            return self._view.doc.add_underline(pi, rects, color=color)
-        return self._view.doc.add_highlight(pi, rects, color=color)
+            return self._active_view.doc.add_underline(pi, rects, color=color)
+        return self._active_view.doc.add_highlight(pi, rects, color=color)
 
     def _add_annotation(self, kind: str, page_index: int, rects: list) -> None:
         color = self._color_for(kind)
@@ -814,9 +895,9 @@ class MainWindow(QMainWindow):
         self._update_undo_actions()
 
     def _on_delete_annotation(self, page_index: int, pdf_xy: tuple) -> None:
-        if self._view.doc is None:
+        if self._active_view.doc is None:
             return
-        removed = self._view.doc.delete_annotation_at(page_index, pdf_xy)
+        removed = self._active_view.doc.delete_annotation_at(page_index, pdf_xy)
         if removed is None:
             return
         self._rerender_page(page_index)
@@ -826,23 +907,23 @@ class MainWindow(QMainWindow):
         self._update_undo_actions()
 
     def _undo(self) -> None:
-        if not self._undo_stack or self._view.doc is None:
+        if not self._undo_stack or self._active_view.doc is None:
             return
         action = self._undo_stack.pop()
         pi = action["page_index"]
         if action["op"] == "add":
-            self._view.doc.remove_annotation_by_xref(pi, action["xref"])
+            self._active_view.doc.remove_annotation_by_xref(pi, action["xref"])
         else:
             action["xref"] = self._create_annot(
                 action["kind"], pi, action["rects"], action["color"]
             )
-        self._rerender_page(pi)
+        self._active_view.rerender_page(pi)
         self._redo_stack.append(action)
         self._document_dirty = True
         self._update_undo_actions()
 
     def _redo(self) -> None:
-        if not self._redo_stack or self._view.doc is None:
+        if not self._redo_stack or self._active_view.doc is None:
             return
         action = self._redo_stack.pop()
         pi = action["page_index"]
@@ -851,8 +932,8 @@ class MainWindow(QMainWindow):
                 action["kind"], pi, action["rects"], action["color"]
             )
         else:
-            self._view.doc.remove_annotation_by_xref(pi, action["xref"])
-        self._rerender_page(pi)
+            self._active_view.doc.remove_annotation_by_xref(pi, action["xref"])
+        self._active_view.rerender_page(pi)
         self._undo_stack.append(action)
         self._document_dirty = True
         self._update_undo_actions()
@@ -910,7 +991,7 @@ class MainWindow(QMainWindow):
     def _do_save_incremental(self) -> bool:
         """Save in-place; show status on success. Returns True on success."""
         try:
-            self._view.doc.save_incremental()  # type: ignore[union-attr]
+            self._active_view.doc.save_incremental()  # type: ignore[union-attr]
             self._document_dirty = False
             self.statusBar().showMessage(_s(self._locale, "status_saved"), 2500)
             return True
@@ -919,13 +1000,13 @@ class MainWindow(QMainWindow):
             return False
 
     def _save(self) -> None:
-        if self._view.doc is None or not self._document_dirty:
+        if self._active_view.doc is None or not self._document_dirty:
             self.statusBar().showMessage(_s(self._locale, "status_no_change"), 2500)
             return
         self._do_save_incremental()
 
     def _prompt_save(self) -> bool:
-        if self._view.doc is None or not self._document_dirty or self._current_path is None:
+        if self._active_view.doc is None or not self._document_dirty or self._current_path is None:
             return True
 
         msg = QMessageBox(self)
@@ -967,7 +1048,7 @@ class MainWindow(QMainWindow):
             if not new_path:
                 return False
             try:
-                self._view.doc.save_as(new_path)
+                self._active_view.doc.save_as(new_path)
                 self._document_dirty = False
                 self.statusBar().showMessage(
                     _s(self._locale, "status_saved_as").format(path=new_path), 3000
@@ -982,9 +1063,15 @@ class MainWindow(QMainWindow):
         return self._do_save_incremental()
 
     def closeEvent(self, event) -> None:
-        if not self._prompt_save():
-            event.ignore()
-            return
+        # Prompt save for both panels (primary first, then secondary if present)
+        saved_active = self._active_view
+        for view in [v for v in [self._view, self._view2] if v is not None]:
+            self._active_view = view
+            if not self._prompt_save():
+                self._active_view = saved_active
+                event.ignore()
+                return
+        self._active_view = saved_active
         super().closeEvent(event)
 
     # ================================================================== #
