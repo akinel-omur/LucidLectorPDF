@@ -35,6 +35,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .bookmark_panel import BookmarkPanel
 from .pdf_document import PdfDocument
 from .pdf_view import PdfView
 from .recent_files import RecentFiles
@@ -129,6 +130,22 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._translation_dock)
         self._translation_dock.hide()
         self.resizeDocks([self._translation_dock], [420], Qt.Orientation.Horizontal)
+
+        # Left-docked bookmark panel
+        self._bookmark_panel = BookmarkPanel()
+        self._bookmark_dock = QDockWidget("Yer İşaretleri", self)
+        self._bookmark_dock.setWidget(self._bookmark_panel)
+        self._bookmark_dock.setAllowedAreas(
+            Qt.DockWidgetArea.LeftDockWidgetArea
+            | Qt.DockWidgetArea.RightDockWidgetArea
+        )
+        self._bookmark_dock.setFeatures(
+            QDockWidget.DockWidgetFeature.DockWidgetClosable
+            | QDockWidget.DockWidgetFeature.DockWidgetMovable
+        )
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self._bookmark_dock)
+        self._bookmark_dock.hide()
+        self.resizeDocks([self._bookmark_dock], [240], Qt.Orientation.Horizontal)
 
         self._build_menu()
         self._build_toolbar()
@@ -254,6 +271,13 @@ class MainWindow(QMainWindow):
         self._act_paragraph.setToolTip("Paragraf başlarına çeviri butonu ekler (Ctrl+P)")
         self._act_paragraph.toggled.connect(self._view.set_paragraph_mode)
         self._menu_view.addAction(self._act_paragraph)
+
+        self._menu_view.addSeparator()
+        self._act_bookmarks = QAction("Yer İşaretleri Paneli", self)
+        self._act_bookmarks.setCheckable(True)
+        self._act_bookmarks.setShortcut(QKeySequence("Ctrl+B"))
+        self._act_bookmarks.setToolTip("Yer işaretleri panelini göster/gizle (Ctrl+B)")
+        self._menu_view.addAction(self._act_bookmarks)
 
         self._menu_view.addSeparator()
         self._act_dual = QAction("İkili Görünüm", self)
@@ -393,6 +417,11 @@ class MainWindow(QMainWindow):
         self._tb_act_find.triggered.connect(self._open_search)
         tb.addAction(self._tb_act_find)
 
+        self._act_bookmarks_tb = QAction("🔖 İçindekiler", self)
+        self._act_bookmarks_tb.setCheckable(True)
+        self._act_bookmarks_tb.setToolTip("Yer işaretleri panelini göster/gizle (Ctrl+B)")
+        tb.addAction(self._act_bookmarks_tb)
+
         tb.addSeparator()
         tb.addAction(self._act_undo)
         tb.addAction(self._act_redo)
@@ -449,6 +478,16 @@ class MainWindow(QMainWindow):
         # Mark primary panel as active and show its indicator on startup.
         self._view.panel_activated.connect(lambda: self._set_active_panel(self._view))
         self._view.set_active_indicator(True)
+
+        # Bookmark panel
+        self._bookmark_panel.page_requested.connect(
+            lambda p: self._active_view.goto_page(p)
+        )
+        # Sync menu ↔ toolbar ↔ dock visibility
+        self._act_bookmarks.toggled.connect(self._bookmark_dock.setVisible)
+        self._act_bookmarks_tb.toggled.connect(self._act_bookmarks.setChecked)
+        self._act_bookmarks.toggled.connect(self._act_bookmarks_tb.setChecked)
+        self._bookmark_dock.visibilityChanged.connect(self._act_bookmarks.setChecked)
 
     # ================================================================== #
     # Locale
@@ -508,6 +547,10 @@ class MainWindow(QMainWindow):
         self._act_paragraph.setText(_s(code, "act_paragraph"))
         self._act_paragraph.setToolTip(_s(code, "tip_paragraph"))
         self._act_dual.setText(_s(code, "act_dual"))
+        self._act_bookmarks.setText(_s(code, "act_bookmarks"))
+        self._act_bookmarks.setToolTip(_s(code, "tip_bookmarks"))
+        self._bookmark_dock.setWindowTitle(_s(code, "dock_bookmarks"))
+        self._bookmark_panel.set_locale(code)
         self._act_split.setText(_s(code, "act_split"))
         self._act_split_tb.setText(_s(code, "tb_split"))
         self._act_split_tb.setToolTip(_s(code, "tip_split"))
@@ -557,6 +600,7 @@ class MainWindow(QMainWindow):
         self._page_input.setValue(page + 1)
         self._page_input.blockSignals(False)
         self._update_status()
+        self._bookmark_panel.highlight_current(page)
 
     def _on_scroll(self, from_view: "PdfView") -> None:
         """Called when either panel scrolls; update status only for the active one."""
@@ -618,6 +662,15 @@ class MainWindow(QMainWindow):
         self._recent.add(path)
         self._refresh_recent_menu()
         self._update_status()
+        # Update bookmark panel for the newly loaded document
+        self._bookmark_panel.set_document(doc)
+        # Auto-show the dock if this file has bookmarks (and dock was closed)
+        if self._bookmark_dock.isHidden():
+            try:
+                if doc.doc.get_toc():
+                    self._bookmark_dock.show()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _update_title(self) -> None:
         """Set window title to reflect currently open files in both panels."""
@@ -712,6 +765,10 @@ class MainWindow(QMainWindow):
         else:
             self._page_input.setMaximum(1)
             self._page_total_label.setText(" / 0  ")
+        # Refresh bookmark panel for the newly active panel's document
+        self._bookmark_panel.set_document(self._active_view.doc)
+        if self._active_view.doc is not None:
+            self._bookmark_panel.highlight_current(self._active_view.current_page())
 
     def _toggle_split(self, checked: bool) -> None:
         """Open or close the second panel next to the main view."""
