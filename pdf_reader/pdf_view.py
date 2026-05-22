@@ -1006,6 +1006,14 @@ class PdfView(QGraphicsView):
             self._stop_autoscroll()
             event.accept()
             return
+        if event.key() == Qt.Key.Key_Left:
+            self.go_prev()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Right:
+            self.go_next()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:

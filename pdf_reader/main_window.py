@@ -322,9 +322,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         self._tb_act_prev = QAction("◀", self)
-        self._tb_act_prev.setShortcuts(
-            [QKeySequence(Qt.Key.Key_PageUp), QKeySequence(Qt.Key.Key_Left)]
-        )
+        self._tb_act_prev.setShortcut(QKeySequence(Qt.Key.Key_PageUp))
         self._tb_act_prev.triggered.connect(lambda: self._goto_rel(-1))
         tb.addAction(self._tb_act_prev)
 
@@ -340,9 +338,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(self._page_total_label)
 
         self._tb_act_next = QAction("▶", self)
-        self._tb_act_next.setShortcuts(
-            [QKeySequence(Qt.Key.Key_PageDown), QKeySequence(Qt.Key.Key_Right)]
-        )
+        self._tb_act_next.setShortcut(QKeySequence(Qt.Key.Key_PageDown))
         self._tb_act_next.triggered.connect(lambda: self._goto_rel(1))
         tb.addAction(self._tb_act_next)
 
