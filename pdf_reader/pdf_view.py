@@ -223,6 +223,7 @@ class PdfView(QGraphicsView):
     page_changed = pyqtSignal(int)
     pdf_sentence_hovered = pyqtSignal(str)   # sentence text under cursor
     pdf_sentence_left = pyqtSignal()
+    panel_activated = pyqtSignal()           # any mouse press — marks this panel as active
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -238,6 +239,7 @@ class PdfView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.doc: PdfDocument | None = None
+        self._owns_doc: bool = True     # False when doc is shared (split view)
         self._zoom: float = 1.0
         self._render_scale: float = 2.0   # oversample for crisp rendering
         self._dual_view: bool = False
@@ -297,6 +299,18 @@ class PdfView(QGraphicsView):
     # ---------- document ----------
     def load(self, doc: PdfDocument) -> None:
         self.clear()
+        self._owns_doc = True
+        self.doc = doc
+        self._current_spread_start = 0
+        self._rebuild()
+
+    def load_shared(self, doc: PdfDocument) -> None:
+        """Load *doc* without taking ownership — the caller owns the document lifecycle.
+
+        Used by the split-view secondary panel so both panels share one fitz handle.
+        """
+        self.clear()          # resets _owns_doc → True; next line overrides it
+        self._owns_doc = False
         self.doc = doc
         self._current_spread_start = 0
         self._rebuild()
@@ -323,8 +337,10 @@ class PdfView(QGraphicsView):
         self._sentence_rects.clear()
         self._last_pdf_hover_sentence = ""
         if self.doc is not None:
-            self.doc.close()
+            if self._owns_doc:
+                self.doc.close()
             self.doc = None
+        self._owns_doc = True   # reset so next load() takes ownership by default
 
     def _rebuild(self) -> None:
         assert self.doc is not None
@@ -526,6 +542,14 @@ class PdfView(QGraphicsView):
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
         self._schedule_visible_render_update()
+
+    # ---------- split-view: active panel indicator ----------
+    def set_active_indicator(self, active: bool) -> None:
+        """Draw a blue border when this panel is the active one, remove it otherwise."""
+        if active:
+            self.setStyleSheet("QGraphicsView { border: 2px solid #4A90D9; }")
+        else:
+            self.setStyleSheet("")
 
     # ---------- locale ----------
     def set_locale(self, code: str) -> None:
@@ -905,6 +929,8 @@ class PdfView(QGraphicsView):
         )
 
     def mousePressEvent(self, event) -> None:
+        # Any click activates this panel (split view support).
+        self.panel_activated.emit()
         # Any click while in autoscroll mode exits it.
         if self._autoscroll_anchor is not None:
             self._stop_autoscroll()

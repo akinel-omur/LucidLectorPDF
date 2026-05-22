@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QSizePolicy,
     QSpinBox,
+    QSplitter,
     QStatusBar,
     QToolBar,
     QVBoxLayout,
@@ -58,6 +59,7 @@ class MainWindow(QMainWindow):
         self._underline_color = self._load_color("underlineColor", "#E53935")
         self._locale: str = "tr"          # set properly in _apply_locale
         self._last_original: str = ""     # for re-translate on lang change
+        self._current_eye_mode: str = "off"   # tracked so new panels inherit it
 
         # Components
         self._view = PdfView(self)
@@ -65,12 +67,20 @@ class MainWindow(QMainWindow):
         self._translator = Translator(self)
         self._recent = RecentFiles()
 
+        # Split-view support
+        self._view2: PdfView | None = None
+        self._active_view: PdfView = self._view   # whichever panel received the last click
+
         container = QWidget(self)
         layout = QVBoxLayout(container)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(self._search)
-        layout.addWidget(self._view, 1)
+        self._splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._splitter.setHandleWidth(4)
+        self._splitter.setStyleSheet("QSplitter::handle { background: #555; }")
+        self._splitter.addWidget(self._view)
+        layout.addWidget(self._splitter, 1)
         self.setCentralWidget(container)
 
         # Right-docked translation panel
@@ -154,17 +164,17 @@ class MainWindow(QMainWindow):
 
         self._act_zoom_in = QAction("Yakınlaştır", self)
         self._act_zoom_in.setShortcuts([QKeySequence("Ctrl++"), QKeySequence("Ctrl+=")])
-        self._act_zoom_in.triggered.connect(self._view.zoom_in)
+        self._act_zoom_in.triggered.connect(lambda: self._active_view.zoom_in())
         self._menu_view.addAction(self._act_zoom_in)
 
         self._act_zoom_out = QAction("Uzaklaştır", self)
         self._act_zoom_out.setShortcut(QKeySequence("Ctrl+-"))
-        self._act_zoom_out.triggered.connect(self._view.zoom_out)
+        self._act_zoom_out.triggered.connect(lambda: self._active_view.zoom_out())
         self._menu_view.addAction(self._act_zoom_out)
 
         self._act_zoom_fit = QAction("Sığdır (sayfa)", self)
         self._act_zoom_fit.setShortcut(QKeySequence("Ctrl+0"))
-        self._act_zoom_fit.triggered.connect(self._view.zoom_fit_page)
+        self._act_zoom_fit.triggered.connect(lambda: self._active_view.zoom_fit_page())
         self._menu_view.addAction(self._act_zoom_fit)
 
         self._menu_view.addSeparator()
@@ -217,6 +227,12 @@ class MainWindow(QMainWindow):
         self._act_dual.setShortcut(QKeySequence("Ctrl+2"))
         self._act_dual.toggled.connect(self._view.set_dual_view)
         self._menu_view.addAction(self._act_dual)
+
+        self._act_split = QAction("Bölünmüş Görünüm", self)
+        self._act_split.setCheckable(True)
+        self._act_split.setShortcut(QKeySequence("Ctrl+\\"))
+        self._act_split.toggled.connect(self._toggle_split)
+        self._menu_view.addAction(self._act_split)
 
         self._menu_view.addSeparator()
         self._act_full = QAction("Tam Ekran", self)
@@ -275,15 +291,15 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         self._tb_act_zin = QAction("＋", self)
-        self._tb_act_zin.triggered.connect(self._view.zoom_in)
+        self._tb_act_zin.triggered.connect(lambda: self._active_view.zoom_in())
         tb.addAction(self._tb_act_zin)
 
         self._tb_act_zout = QAction("－", self)
-        self._tb_act_zout.triggered.connect(self._view.zoom_out)
+        self._tb_act_zout.triggered.connect(lambda: self._active_view.zoom_out())
         tb.addAction(self._tb_act_zout)
 
         self._tb_act_fit = QAction("Fit", self)
-        self._tb_act_fit.triggered.connect(self._view.zoom_fit_page)
+        self._tb_act_fit.triggered.connect(lambda: self._active_view.zoom_fit_page())
         tb.addAction(self._tb_act_fit)
 
         tb.addSeparator()
@@ -306,6 +322,15 @@ class MainWindow(QMainWindow):
         self._act_single_tb.triggered.connect(lambda: self._set_view_mode(False))
         self._act_dual_tb.triggered.connect(lambda: self._set_view_mode(True))
         self._act_dual.toggled.connect(self._set_view_mode)
+
+        # Split-view toggle
+        self._act_split_tb = QAction("⊟ Böl", self)
+        self._act_split_tb.setCheckable(True)
+        self._act_split_tb.setToolTip("Görünümü ikiye böl (Ctrl+\\)")
+        tb.addAction(self._act_split_tb)
+        # Sync toolbar ↔ menu without double-firing _toggle_split
+        self._act_split_tb.toggled.connect(self._act_split.setChecked)
+        self._act_split.toggled.connect(self._act_split_tb.setChecked)
 
         tb.addSeparator()
 
@@ -381,8 +406,15 @@ class MainWindow(QMainWindow):
         self._view.pdf_sentence_hovered.connect(self._translation_panel.highlight_sentence)
         self._view.pdf_sentence_left.connect(self._translation_panel.clear_sentence_highlight)
 
-        self._view.verticalScrollBar().valueChanged.connect(self._update_status)
-        self._view.page_changed.connect(self._on_page_changed)
+        self._view.verticalScrollBar().valueChanged.connect(
+            lambda: self._on_scroll(self._view)
+        )
+        self._view.page_changed.connect(
+            lambda p: self._on_page_changed(p, self._view)
+        )
+        # Mark primary panel as active and show its indicator on startup.
+        self._view.panel_activated.connect(lambda: self._set_active_panel(self._view))
+        self._view.set_active_indicator(True)
 
     # ================================================================== #
     # Locale
@@ -403,8 +435,10 @@ class MainWindow(QMainWindow):
         self._translation_panel.set_target_language(code)
         self._translation_panel.set_locale(code)
 
-        # PDF view context menu
+        # PDF view context menus (both panels)
         self._view.set_locale(code)
+        if self._view2 is not None:
+            self._view2.set_locale(code)
 
         # Dock title
         self._translation_dock.setWindowTitle(_s(code, "dock_title"))
@@ -440,6 +474,9 @@ class MainWindow(QMainWindow):
         self._act_paragraph.setText(_s(code, "act_paragraph"))
         self._act_paragraph.setToolTip(_s(code, "tip_paragraph"))
         self._act_dual.setText(_s(code, "act_dual"))
+        self._act_split.setText(_s(code, "act_split"))
+        self._act_split_tb.setText(_s(code, "tb_split"))
+        self._act_split_tb.setToolTip(_s(code, "tip_split"))
         self._act_full.setText(_s(code, "act_fullscreen"))
         self._act_find_menu.setText(_s(code, "act_find"))
 
@@ -474,31 +511,38 @@ class MainWindow(QMainWindow):
     # Page navigation
     # ================================================================== #
     def _sync_page_input(self) -> None:
-        """Update the page spinbox to match the view's current page (no signal)."""
+        """Update the page spinbox to match the active panel's current page (no signal)."""
         self._page_input.blockSignals(True)
-        self._page_input.setValue(self._view.current_page() + 1)
+        self._page_input.setValue(self._active_view.current_page() + 1)
         self._page_input.blockSignals(False)
 
-    def _on_page_changed(self, page: int) -> None:
+    def _on_page_changed(self, page: int, from_view: "PdfView | None" = None) -> None:
+        if from_view is not None and from_view is not self._active_view:
+            return
         self._page_input.blockSignals(True)
         self._page_input.setValue(page + 1)
         self._page_input.blockSignals(False)
         self._update_status()
 
+    def _on_scroll(self, from_view: "PdfView") -> None:
+        """Called when either panel scrolls; update status only for the active one."""
+        if from_view is self._active_view:
+            self._update_status()
+
     def _goto_rel(self, delta: int) -> None:
-        if self._view.doc is None:
+        if self._active_view.doc is None:
             return
         if delta > 0:
-            self._view.go_next()
+            self._active_view.go_next()
         elif delta < 0:
-            self._view.go_prev()
+            self._active_view.go_prev()
         self._sync_page_input()
         self._update_status()
 
     def _goto_from_input(self) -> None:
-        if self._view.doc is None:
+        if self._active_view.doc is None:
             return
-        self._view.goto_page(self._page_input.value() - 1)
+        self._active_view.goto_page(self._page_input.value() - 1)
         self._sync_page_input()
         self._update_status()
 
@@ -528,6 +572,8 @@ class MainWindow(QMainWindow):
             )
             return
         self._view.load(doc)
+        if self._view2 is not None:
+            self._view2.load_shared(doc)
         self._current_path = Path(path)
         self._document_dirty = False
         self._undo_stack.clear()
@@ -577,7 +623,10 @@ class MainWindow(QMainWindow):
             "karartma":  QColor(  0,   0,   0,  90),
         }
         color = colors.get(mode)
+        self._current_eye_mode = mode
         self._view.set_eye_filter(color)
+        if self._view2 is not None:
+            self._view2.set_eye_filter(color)
         self._translation_panel.set_eye_filter(color)
         self._settings.setValue("eyeFilter", mode)
 
@@ -592,6 +641,77 @@ class MainWindow(QMainWindow):
             self._act_dual_tb.setChecked(True)
         if not dual and not self._act_single_tb.isChecked():
             self._act_single_tb.setChecked(True)
+
+    def _set_active_panel(self, view: "PdfView") -> None:
+        """Called when a panel receives a mouse-press; routes actions to it."""
+        # Guard: ignore stale signals from a panel that was already removed.
+        if view is not self._view and view is not self._view2:
+            return
+        if view is self._active_view:
+            return
+        self._active_view = view
+        self._view.set_active_indicator(view is self._view)
+        if self._view2 is not None:
+            self._view2.set_active_indicator(view is self._view2)
+        self._sync_page_input()
+        self._update_status()
+
+    def _toggle_split(self, checked: bool) -> None:
+        """Open or close the second panel next to the main view."""
+        if checked:
+            if self._view2 is not None:
+                return   # already split
+            self._view2 = PdfView(self)
+            v2 = self._view2   # stable local reference for lambda captures
+            # Navigation / activation signals
+            v2.panel_activated.connect(lambda: self._set_active_panel(v2))
+            v2.verticalScrollBar().valueChanged.connect(
+                lambda: self._on_scroll(v2)
+            )
+            v2.page_changed.connect(
+                lambda p: self._on_page_changed(p, v2)
+            )
+            # Annotation / translation signals — same handlers as primary view
+            v2.translate_requested.connect(self._on_translate)
+            v2.highlight_requested.connect(self._on_highlight)
+            v2.underline_requested.connect(self._on_underline)
+            v2.delete_annotation_requested.connect(self._on_delete_annotation)
+            v2.pdf_sentence_hovered.connect(
+                self._translation_panel.highlight_sentence
+            )
+            v2.pdf_sentence_left.connect(
+                self._translation_panel.clear_sentence_highlight
+            )
+            # Apply current UI state to the new panel
+            v2.set_locale(self._locale)
+            colors: dict[str, "QColor"] = {
+                "hafif":     QColor(255, 210, 140,  30),
+                "warm":      QColor(255, 220, 150,  55),
+                "sepia":     QColor(245, 220, 180,  75),
+                "yesil":     QColor( 80, 200,  80,  38),
+                "pembe":     QColor(255, 160, 180,  45),
+                "gece":      QColor(255, 130,  60, 110),
+                "koyu_gece": QColor(255, 100,  30, 155),
+                "karartma":  QColor(  0,   0,   0,  90),
+            }
+            v2.set_eye_filter(colors.get(self._current_eye_mode))
+            # Add to splitter and load shared document if one is open
+            self._splitter.addWidget(v2)
+            v2.show()
+            if self._view.doc is not None:
+                v2.load_shared(self._view.doc)
+        else:
+            if self._view2 is None:
+                return
+            self._view2.clear()
+            self._view2.setParent(None)   # type: ignore[arg-type]
+            self._view2.deleteLater()
+            self._view2 = None
+            # Primary panel becomes the only active panel
+            self._active_view = self._view
+            self._view.set_active_indicator(True)
+            self._sync_page_input()
+            self._update_status()
 
     def _rotate_pages(self, delta: int = 90) -> None:
         if self._view.doc is None:
@@ -660,6 +780,12 @@ class MainWindow(QMainWindow):
     # ================================================================== #
     # Annotations (highlight + underline)
     # ================================================================== #
+    def _rerender_page(self, page_index: int) -> None:
+        """Re-render *page_index* in both panels (annotation changes need this)."""
+        self._view.rerender_page(page_index)
+        if self._view2 is not None:
+            self._view2.rerender_page(page_index)
+
     def _on_highlight(self, page_index: int, rects: list) -> None:
         self._add_annotation("highlight", page_index, rects)
 
@@ -678,7 +804,7 @@ class MainWindow(QMainWindow):
         xref = self._create_annot(kind, page_index, rects, color)
         if xref is None:
             return
-        self._view.rerender_page(page_index)
+        self._rerender_page(page_index)
         self._document_dirty = True
         self._undo_stack.append(
             {"op": "add", "kind": kind, "page_index": page_index,
@@ -693,7 +819,7 @@ class MainWindow(QMainWindow):
         removed = self._view.doc.delete_annotation_at(page_index, pdf_xy)
         if removed is None:
             return
-        self._view.rerender_page(page_index)
+        self._rerender_page(page_index)
         self._document_dirty = True
         self._undo_stack.append({"op": "delete", "page_index": page_index, **removed})
         self._redo_stack.clear()
@@ -710,7 +836,7 @@ class MainWindow(QMainWindow):
             action["xref"] = self._create_annot(
                 action["kind"], pi, action["rects"], action["color"]
             )
-        self._view.rerender_page(pi)
+        self._rerender_page(pi)
         self._redo_stack.append(action)
         self._document_dirty = True
         self._update_undo_actions()
@@ -726,7 +852,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self._view.doc.remove_annotation_by_xref(pi, action["xref"])
-        self._view.rerender_page(pi)
+        self._rerender_page(pi)
         self._undo_stack.append(action)
         self._document_dirty = True
         self._update_undo_actions()
@@ -865,16 +991,17 @@ class MainWindow(QMainWindow):
     # Status bar
     # ================================================================== #
     def _update_status(self) -> None:
-        if self._view.doc is None:
+        v = self._active_view
+        if v.doc is None:
             self._status_page.setText("")
             self._status_zoom.setText("")
             return
-        cur = self._view.current_page() + 1
-        total = self._view.doc.page_count
+        cur = v.current_page() + 1
+        total = v.doc.page_count
         self._status_page.setText(
             _s(self._locale, "status_page").format(cur=cur, total=total) + "   "
         )
-        self._status_zoom.setText(f"{int(self._view.zoom() * 100)}%   ")
+        self._status_zoom.setText(f"{int(v.zoom() * 100)}%   ")
 
     # ================================================================== #
     # About
