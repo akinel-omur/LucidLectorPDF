@@ -3,12 +3,26 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QHBoxLayout,
     QLabel,
+    QPushButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
+
+_BTN_STYLE = """
+QPushButton {
+    background: #2a2a2a;
+    color: #bbb;
+    border: none;
+    padding: 3px 8px;
+    font-size: 12px;
+}
+QPushButton:hover  { background: #333; color: #fff; }
+QPushButton:pressed { background: #1a1a1a; }
+"""
 
 
 class BookmarkPanel(QWidget):
@@ -26,7 +40,27 @@ class BookmarkPanel(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
 
-        # Tree
+        # ── Expand / Collapse toolbar ──────────────────────────────────
+        btn_bar = QWidget()
+        btn_bar.setStyleSheet("background: #252525;")
+        btn_lay = QHBoxLayout(btn_bar)
+        btn_lay.setContentsMargins(4, 2, 4, 2)
+        btn_lay.setSpacing(4)
+
+        self._btn_expand = QPushButton("＋ Hepsini Aç")
+        self._btn_expand.setStyleSheet(_BTN_STYLE)
+        self._btn_expand.clicked.connect(self._tree_expand_all)
+        btn_lay.addWidget(self._btn_expand)
+
+        self._btn_collapse = QPushButton("－ Hepsini Kapat")
+        self._btn_collapse.setStyleSheet(_BTN_STYLE)
+        self._btn_collapse.clicked.connect(self._tree_collapse_all)
+        btn_lay.addWidget(self._btn_collapse)
+
+        btn_lay.addStretch()
+        lay.addWidget(btn_bar)
+
+        # ── Tree ───────────────────────────────────────────────────────
         self._tree = QTreeWidget()
         self._tree.setHeaderHidden(True)
         self._tree.setIndentation(14)
@@ -55,7 +89,7 @@ class BookmarkPanel(QWidget):
         self._tree.itemClicked.connect(self._on_clicked)
         lay.addWidget(self._tree)
 
-        # Empty-state label (shown when the PDF has no TOC)
+        # ── Empty-state label ──────────────────────────────────────────
         self._empty = QLabel("Bu belgede yer işareti yok")
         self._empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._empty.setWordWrap(True)
@@ -110,7 +144,8 @@ class BookmarkPanel(QWidget):
 
             stack.append((level, item))
 
-        self._tree.expandAll()
+        # Default: all collapsed
+        self._tree.collapseAll()
 
     def highlight_current(self, page: int) -> None:
         """Select the deepest bookmark whose page is ≤ *page* (0-based).
@@ -129,21 +164,23 @@ class BookmarkPanel(QWidget):
         for item_page, item in items:
             if item_page <= page:
                 best = item
-            # items are in ascending page order; stop early once we've gone past
             elif item_page > page:
                 break
 
         if best is None:
             return
+        # Ensure the item is visible by expanding its ancestors
         self._tree.blockSignals(True)
         self._tree.setCurrentItem(best)
-        self._tree.scrollToItem(best, QTreeWidget.ScrollHint.PositionAtCenter)
+        self._tree.scrollToItem(best, QTreeWidget.ScrollHint.EnsureVisible)
         self._tree.blockSignals(False)
 
     def set_locale(self, code: str) -> None:
-        """Update the empty-state message for *code*."""
+        """Update localised strings for *code*."""
         from .i18n import s as _s
         self._empty.setText(_s(code, "bookmarks_empty"))
+        self._btn_expand.setText(_s(code, "bm_expand_all"))
+        self._btn_collapse.setText(_s(code, "bm_collapse_all"))
 
     def set_eye_filter(self, color: object | None) -> None:
         """Not used visually; kept for API symmetry with other panels."""
@@ -151,9 +188,17 @@ class BookmarkPanel(QWidget):
     # ------------------------------------------------------------------ #
     # Private helpers
     # ------------------------------------------------------------------ #
+    def _tree_expand_all(self) -> None:
+        self._tree.expandAll()
+
+    def _tree_collapse_all(self) -> None:
+        self._tree.collapseAll()
+
     def _show_state(self, *, empty: bool) -> None:
         self._tree.setVisible(not empty)
         self._empty.setVisible(empty)
+        self._btn_expand.setEnabled(not empty)
+        self._btn_collapse.setEnabled(not empty)
 
     def _on_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         page = item.data(0, Qt.ItemDataRole.UserRole)
