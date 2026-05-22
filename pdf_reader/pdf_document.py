@@ -39,6 +39,7 @@ class PdfDocument:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.doc = fitz.open(self.path)
+        self._page_size_cache: dict[int, tuple[float, float]] = {}
         self._words_cache: dict[int, list[Word]] = {}
         self._paragraphs_cache: list[dict] | None = None
         self._paragraphs_by_page: dict[int, list[tuple[fitz.Rect, str]]] | None = None
@@ -53,8 +54,12 @@ class PdfDocument:
         return self.doc.page_count
 
     def page_size(self, page_index: int) -> tuple[float, float]:
+        if page_index in self._page_size_cache:
+            return self._page_size_cache[page_index]
         page = self.doc[page_index]
-        return page.rect.width, page.rect.height
+        size = (page.rect.width, page.rect.height)
+        self._page_size_cache[page_index] = size
+        return size
 
     def render_page(self, page_index: int, zoom: float = 1.0) -> QImage:
         page = self.doc[page_index]
@@ -277,6 +282,7 @@ class PdfDocument:
         for i in range(self.page_count):
             page = self.doc[i]
             page.set_rotation((page.rotation + delta_degrees) % 360)
+        self._page_size_cache.clear()
         self._words_cache.clear()
         self._paragraphs_cache = None
         self._paragraphs_by_page = None

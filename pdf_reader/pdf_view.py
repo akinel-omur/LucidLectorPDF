@@ -4,13 +4,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import fitz
-from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QPoint, QPointF, QRectF, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
     QBrush,
     QColor,
     QCursor,
     QGuiApplication,
+    QImage,
     QPainter,
     QPainterPath,
     QPen,
@@ -26,6 +27,54 @@ from PyQt6.QtWidgets import (
     QMenu,
     QWidget,
 )
+
+
+class _RenderSignals(QObject):
+    """Carry a finished page render back to the main thread."""
+    done = pyqtSignal(int, object)   # page_index, QImage
+
+
+class _PageRenderTask(QRunnable):
+    """Render one PDF page off the main thread via an independent fitz handle."""
+
+    def __init__(
+        self,
+        path: str,
+        page_index: int,
+        zoom: float,
+        k: float,
+        generation: int,
+        signals: _RenderSignals,
+    ) -> None:
+        super().__init__()
+        self.setAutoDelete(True)
+        self._path = path
+        self._page_index = page_index
+        self._zoom = zoom
+        self._k = k
+        self._generation = generation
+        self._signals = signals
+
+    def run(self) -> None:  # noqa: D102
+        doc = None
+        try:
+            import fitz as _fitz  # noqa: PLC0415
+            doc = _fitz.open(self._path)
+            page = doc[self._page_index]
+            matrix = _fitz.Matrix(self._zoom * self._k, self._zoom * self._k)
+            pix = page.get_pixmap(matrix=matrix, alpha=False)
+            img = QImage(
+                pix.samples, pix.width, pix.height, pix.stride,
+                QImage.Format.Format_RGB888,
+            ).copy()   # detach from pix buffer before doc.close()
+            doc.close()
+            self._signals.done.emit(self._page_index, img)
+        except Exception:  # noqa: BLE001
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 class ParagraphMarker(QGraphicsObject):
@@ -144,6 +193,9 @@ from .translation_popup import _sentence_boundaries
 
 
 PAGE_GAP = 12  # pixels between pages in scene
+RENDER_KEEP_VIEWPORTS = 3  # keep rendered pages within this many viewport heights
+RENDER_LOAD_VIEWPORTS = 1   # pre-render pages just outside the visible viewport
+MERGED_PARAGRAPH_PAGE_LIMIT = 300
 SELECTION_COLOR    = QColor( 80, 140, 255,  90)
 HIGHLIGHT_COLOR    = QColor(255, 230,   0, 110)
 SEARCH_COLOR       = QColor(255, 235,   0, 140)
@@ -193,6 +245,8 @@ class PdfView(QGraphicsView):
         self._wheel_accum: int = 0            # wheel delta accumulator (dual view)
         self._pages: list[PageLayout | None] = []
         self._page_items: list[QGraphicsPixmapItem | None] = []
+        self._page_placeholders: list[QGraphicsRectItem | None] = []
+        self._rendered_pages: set[int] = set()
         self._selection_items: list[QGraphicsRectItem] = []
         self._search_items: list[QGraphicsRectItem] = []
         self._search_rects: list[tuple[int, fitz.Rect]] = []  # (page, rect) flat
@@ -223,11 +277,22 @@ class PdfView(QGraphicsView):
         self._autoscroll_timer = QTimer(self)
         self._autoscroll_timer.setInterval(16)  # ~60 fps
         self._autoscroll_timer.timeout.connect(self._tick_autoscroll)
+        self._render_update_timer = QTimer(self)
+        self._render_update_timer.setSingleShot(True)
+        self._render_update_timer.setInterval(30)
+        self._render_update_timer.timeout.connect(self._update_visible_pages)
         self._selected_words: list[Word] = []
         self._selected_rects_by_page: dict[int, list[fitz.Rect]] = {}
 
+        # Async rendering support
+        self._pending_renders: set[int] = set()       # pages currently in the thread pool
+        self._render_generation: int = 0              # bumped on rebuild/zoom to discard stale results
+        self._render_pool: QThreadPool = QThreadPool.globalInstance()
+
         self.setBackgroundBrush(QBrush(QColor(Qt.GlobalColor.black)))
         self._scene.setBackgroundBrush(QBrush(QColor(Qt.GlobalColor.black)))
+        self.verticalScrollBar().valueChanged.connect(self._schedule_visible_render_update)
+        self.horizontalScrollBar().valueChanged.connect(self._schedule_visible_render_update)
 
     # ---------- document ----------
     def load(self, doc: PdfDocument) -> None:
@@ -237,9 +302,16 @@ class PdfView(QGraphicsView):
         self._rebuild()
 
     def clear(self) -> None:
+        # Discard any in-flight renders before clearing state.
+        self._render_generation += 1
+        self._pending_renders.clear()
+        self._render_update_timer.stop()
+
         self._scene.clear()
         self._pages.clear()
         self._page_items.clear()
+        self._page_placeholders.clear()
+        self._rendered_pages.clear()
         self._selection_items.clear()
         self._search_items.clear()
         self._search_rects.clear()
@@ -256,9 +328,15 @@ class PdfView(QGraphicsView):
 
     def _rebuild(self) -> None:
         assert self.doc is not None
+        # Discard any in-flight renders from the previous layout.
+        self._render_generation += 1
+        self._pending_renders.clear()
+
         self._scene.clear()
         self._pages = [None] * self.doc.page_count
         self._page_items = [None] * self.doc.page_count
+        self._page_placeholders = [None] * self.doc.page_count
+        self._rendered_pages.clear()
         self._selection_items.clear()
         self._search_items.clear()
         # scene.clear() already destroyed these; drop the Python refs so the
@@ -266,9 +344,8 @@ class PdfView(QGraphicsView):
         self._paragraph_markers.clear()
         self._hover_items.clear()   # scene.clear() destroyed them too
 
-        K = self._render_scale
-
-        # Dual view renders only the current spread; single view renders all pages.
+        # Dual view lays out only the current spread; single view lays out every
+        # page but renders pixmaps lazily as they approach the viewport.
         if self._dual_view:
             s = self._current_spread_start
             indices = [s] + ([s + 1] if s + 1 < self.doc.page_count else [])
@@ -297,15 +374,14 @@ class PdfView(QGraphicsView):
             x = (max_row_w - row_w) / 2.0
             for p_idx in row:
                 scene_w, scene_h = scene_sizes[p_idx]
-                img = self.doc.render_page(p_idx, zoom=self._zoom * K)
-                pix = QPixmap.fromImage(img)
-                item = QGraphicsPixmapItem(pix)
-                item.setScale(1.0 / K)
-                item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
                 py = y + (row_h - scene_h) / 2.0
-                item.setPos(x, py)
-                self._scene.addItem(item)
-                self._page_items[p_idx] = item
+                placeholder = self._scene.addRect(
+                    QRectF(x, py, scene_w, scene_h),
+                    QPen(Qt.PenStyle.NoPen),
+                    QBrush(QColor(45, 45, 45)),
+                )
+                placeholder.setZValue(0)
+                self._page_placeholders[p_idx] = placeholder
 
                 pdf_w, pdf_h = self.doc.page_size(p_idx)
                 self._pages[p_idx] = PageLayout(
@@ -328,6 +404,128 @@ class PdfView(QGraphicsView):
         # Re-apply paragraph markers if mode is on.
         if self._paragraph_mode:
             self._refresh_paragraph_markers()
+        self._update_visible_pages()
+
+    def _schedule_visible_render_update(self, *_args) -> None:
+        if self.doc is not None:
+            self._render_update_timer.start()
+
+    def _visible_scene_rect(self, extra_viewports: int = 0) -> QRectF:
+        rect = self.mapToScene(self.viewport().rect()).boundingRect()
+        if extra_viewports <= 0:
+            return rect
+        pad_x = self.viewport().width() * 0.5
+        pad_y = self.viewport().height() * extra_viewports
+        return rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+
+    def _page_indices_near_viewport(self, extra_viewports: int) -> set[int]:
+        if self.doc is None:
+            return set()
+        if self._dual_view:
+            s = self._current_spread_start
+            return {i for i in (s, s + 1) if i < self.doc.page_count}
+        visible = self._visible_scene_rect(extra_viewports)
+        out: set[int] = set()
+        for page in self._pages:
+            if page is None:
+                continue
+            page_rect = QRectF(page.x_offset, page.y_offset, page.width, page.height)
+            if visible.intersects(page_rect):
+                out.add(page.index)
+        return out
+
+    def _ensure_page_rendered(self, page_index: int) -> None:
+        """Schedule async rendering for *page_index* if not already rendered/pending."""
+        if self.doc is None:
+            return
+        if page_index in self._rendered_pages or page_index in self._pending_renders:
+            return
+        if page_index >= len(self._pages):
+            return
+        if self._pages[page_index] is None:
+            return
+
+        self._pending_renders.add(page_index)
+        sig = _RenderSignals()
+        gen = self._render_generation
+        sig.done.connect(
+            lambda idx, img, g=gen: self._on_page_ready(idx, img, g)
+        )
+        task = _PageRenderTask(
+            str(self.doc.path),
+            page_index,
+            self._zoom,
+            self._render_scale,
+            gen,
+            sig,
+        )
+        task._sig_keepalive = sig   # keep QObject alive until the slot fires  # noqa: SLF001
+        self._render_pool.start(task)
+
+    def _on_page_ready(self, page_index: int, img: object, generation: int) -> None:
+        """Called from a worker thread via signal — place the rendered page in the scene."""
+        if generation != self._render_generation:
+            return   # stale result from before a zoom/rebuild
+        self._pending_renders.discard(page_index)
+        if self.doc is None:
+            return
+        layout = self._pages[page_index]
+        if layout is None:
+            return
+        K = self._render_scale
+        pix = QPixmap.fromImage(img)  # type: ignore[arg-type]
+        item = QGraphicsPixmapItem(pix)
+        item.setScale(1.0 / K)
+        item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
+        item.setPos(layout.x_offset, layout.y_offset)
+        item.setZValue(1)
+        self._scene.addItem(item)
+        self._page_items[page_index] = item
+        self._rendered_pages.add(page_index)
+        # Hide the placeholder now that the real pixmap is in place.
+        ph = self._page_placeholders[page_index]
+        if ph is not None:
+            ph.setVisible(False)
+        # Refresh overlays that were waiting for this page to be rendered.
+        if self._search_rects:
+            self._redraw_search_overlays()
+
+    def _unload_page(self, page_index: int) -> None:
+        if page_index >= len(self._page_items):
+            return
+        item = self._page_items[page_index]
+        if item is not None:
+            try:
+                self._scene.removeItem(item)
+            except RuntimeError:
+                pass
+        self._page_items[page_index] = None
+        self._rendered_pages.discard(page_index)
+        # Restore the placeholder so the page slot stays visible while
+        # it is unloaded (the page may be re-rendered when scrolled back).
+        ph = self._page_placeholders[page_index]
+        if ph is not None:
+            ph.setVisible(True)
+
+    def _update_visible_pages(self) -> None:
+        if self.doc is None:
+            return
+        to_render = self._page_indices_near_viewport(RENDER_LOAD_VIEWPORTS)
+        for page_index in sorted(to_render):
+            self._ensure_page_rendered(page_index)
+
+        keep = self._page_indices_near_viewport(RENDER_KEEP_VIEWPORTS)
+        for page_index in list(self._rendered_pages - keep):
+            self._unload_page(page_index)
+
+        if self._search_rects:
+            self._redraw_search_overlays()
+        if self._paragraph_mode:
+            self._refresh_paragraph_markers()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._schedule_visible_render_update()
 
     # ---------- locale ----------
     def set_locale(self, code: str) -> None:
@@ -483,18 +681,29 @@ class PdfView(QGraphicsView):
         self._active_paragraph_marker = None
         if not self._paragraph_mode or self.doc is None:
             return
-        # First-time computation walks every page; show busy cursor until the
-        # cache is primed. Subsequent calls hit O(visible blocks) lookup.
-        if not self.doc.has_paragraphs_cached():
+        visible_pages = sorted(self._page_indices_near_viewport(RENDER_LOAD_VIEWPORTS))
+        if not visible_pages:
+            return
+
+        use_merged = self.doc.page_count <= MERGED_PARAGRAPH_PAGE_LIMIT
+        # Merged paragraphs require a full-document walk. Keep that richer
+        # behavior for ordinary PDFs, but avoid it for very large files.
+        if use_merged and not self.doc.has_paragraphs_cached():
             QGuiApplication.setOverrideCursor(QCursor(Qt.CursorShape.WaitCursor))
             try:
                 self.doc.merged_paragraphs()
             finally:
                 QGuiApplication.restoreOverrideCursor()
-        for page in self._pages:
+        for page_index in visible_pages:
+            page = self._pages[page_index]
             if page is None:
                 continue
-            for rect, full_text in self.doc.paragraphs_for_page(page.index):
+            paragraphs = (
+                self.doc.paragraphs_for_page(page.index)
+                if use_merged
+                else self.doc.paragraphs(page.index)
+            )
+            for rect, full_text in paragraphs:
                 scene_rect = self._pdf_rect_to_scene(page, rect)
                 marker = ParagraphMarker(full_text)
                 x = max(
@@ -1024,6 +1233,7 @@ class PdfView(QGraphicsView):
             return
         item = self._page_items[page_index]
         if item is None:
+            self._ensure_page_rendered(page_index)
             return
         img = self.doc.render_page(page_index, zoom=self._zoom * self._render_scale)
         item.setPixmap(QPixmap.fromImage(img))
@@ -1050,7 +1260,12 @@ class PdfView(QGraphicsView):
             self._scene.removeItem(item)
         self._search_items.clear()
         pen = QPen(Qt.PenStyle.NoPen)
+        pages_to_draw = self._page_indices_near_viewport(RENDER_LOAD_VIEWPORTS)
+        if 0 <= self._active_search_index < len(self._search_rects):
+            pages_to_draw.add(self._search_rects[self._active_search_index][0])
         for i, (pi, rect) in enumerate(self._search_rects):
+            if pi not in pages_to_draw:
+                continue
             if pi >= len(self._pages) or self._pages[pi] is None:
                 continue
             color = SEARCH_ACTIVE_COLOR if i == self._active_search_index else SEARCH_COLOR
@@ -1074,13 +1289,10 @@ class PdfView(QGraphicsView):
             if target_spread != self._current_spread_start:
                 self._current_spread_start = target_spread
                 self._rebuild()  # redraws overlays at the end
-            else:
-                self._redraw_search_overlays()
-        else:
-            self._redraw_search_overlays()
         page = self._pages[page_index]
         if page is not None:
             self.centerOn(self._pdf_rect_to_scene(page, rect).center())
+        self._update_visible_pages()
 
     def search_next(self) -> None:
         if self._search_rects:
