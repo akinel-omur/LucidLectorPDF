@@ -201,9 +201,16 @@ class BookmarkPanel(QWidget):
         self._btn_collapse.setEnabled(not empty)
 
     def _on_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
+        # Expand the clicked item and all its descendants
+        self._expand_subtree(item)
         page = item.data(0, Qt.ItemDataRole.UserRole)
         if page is not None:
             self.page_requested.emit(int(page))
+
+    def _expand_subtree(self, item: QTreeWidgetItem) -> None:
+        item.setExpanded(True)
+        for i in range(item.childCount()):
+            self._expand_subtree(item.child(i))
 
     def _collect(
         self,
