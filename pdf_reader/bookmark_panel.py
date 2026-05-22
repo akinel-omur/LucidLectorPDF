@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QKeyEvent
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -11,6 +12,26 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+class _BookmarkTree(QTreeWidget):
+    """QTreeWidget that expands/collapses full subtrees on ←/→."""
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        item = self.currentItem()
+        if item is not None:
+            if event.key() == Qt.Key.Key_Right:
+                self._set_subtree(item, expanded=True)
+                return
+            if event.key() == Qt.Key.Key_Left:
+                self._set_subtree(item, expanded=False)
+                return
+        super().keyPressEvent(event)
+
+    def _set_subtree(self, item: QTreeWidgetItem, *, expanded: bool) -> None:
+        item.setExpanded(expanded)
+        for i in range(item.childCount()):
+            self._set_subtree(item.child(i), expanded=expanded)
 
 _BTN_STYLE = """
 QPushButton {
@@ -61,7 +82,7 @@ class BookmarkPanel(QWidget):
         lay.addWidget(btn_bar)
 
         # ── Tree ───────────────────────────────────────────────────────
-        self._tree = QTreeWidget()
+        self._tree = _BookmarkTree()
         self._tree.setHeaderHidden(True)
         self._tree.setIndentation(14)
         self._tree.setAnimated(True)
@@ -202,15 +223,10 @@ class BookmarkPanel(QWidget):
 
     def _on_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         # Expand the clicked item and all its descendants
-        self._expand_subtree(item)
+        self._tree._set_subtree(item, expanded=True)
         page = item.data(0, Qt.ItemDataRole.UserRole)
         if page is not None:
             self.page_requested.emit(int(page))
-
-    def _expand_subtree(self, item: QTreeWidgetItem) -> None:
-        item.setExpanded(True)
-        for i in range(item.childCount()):
-            self._expand_subtree(item.child(i))
 
     def _collect(
         self,
