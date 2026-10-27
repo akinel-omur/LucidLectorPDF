@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LucidLector — Akademik PDF Okuyucu</title>
+<meta name="description" content="Akademik PDF okuyucu: anlık çeviri, paragraf çevirisi ve cümle eşleştirme. Her şey tarayıcınızda çalışır, dosyanız hiçbir yere yüklenmez.">
+<link rel="icon" href="assets/icon.png">
+<link rel="stylesheet" href="vendor/text_layer.css">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+
+<header class="toolbar" id="toolbar">
+  <div class="tb-group tb-brand">
+    <img src="assets/icon.png" alt="" class="brand-icon" width="26" height="26">
+    <span class="brand-name">LucidLector</span>
+  </div>
+
+  <div class="tb-group">
+    <button class="btn btn-primary" id="btn-open" data-i18n-title="tip_open">
+      <span aria-hidden="true">📂</span><span data-i18n="tb_open">Aç</span>
+    </button>
+    <input type="file" id="file-input" accept="application/pdf,.pdf" hidden>
+  </div>
+
+  <div class="tb-group tb-pages" hidden id="grp-pages">
+    <button class="btn btn-icon" id="btn-prev" data-i18n-title="tip_prev">‹</button>
+    <input type="number" id="page-input" class="page-input" min="1" value="1" aria-label="Sayfa">
+    <span class="page-total" id="page-total">/ 0</span>
+    <button class="btn btn-icon" id="btn-next" data-i18n-title="tip_next">›</button>
+  </div>
+
+  <div class="tb-group tb-zoom" hidden id="grp-zoom">
+    <button class="btn btn-icon" id="btn-zoom-out" data-i18n-title="tip_zoom_out">−</button>
+    <span class="zoom-level" id="zoom-level">100%</span>
+    <button class="btn btn-icon" id="btn-zoom-in" data-i18n-title="tip_zoom_in">+</button>
+    <button class="btn btn-icon" id="btn-fit-page" data-i18n-title="tip_zoom_fit">⛶</button>
+    <button class="btn btn-icon" id="btn-fit-width" data-i18n-title="tip_zoom_width">↔</button>
+  </div>
+
+  <div class="tb-spacer"></div>
+
+  <div class="tb-group" hidden id="grp-tools">
+    <button class="btn btn-icon" id="btn-bookmarks" data-i18n-title="tip_bookmarks">📑</button>
+    <button class="btn btn-icon" id="btn-find" data-i18n-title="tip_find">🔍</button>
+    <button class="btn btn-icon" id="btn-paragraph" data-i18n-title="tip_paragraph">¶</button>
+    <select class="select" id="eye-select" aria-label="Göz koruması">
+      <option value="off" data-i18n="eye_off">Kapalı</option>
+      <option value="hafif" data-i18n="eye_hafif">Hafif Sıcak</option>
+      <option value="warm" data-i18n="eye_warm">Sıcak</option>
+      <option value="sepia" data-i18n="eye_sepia">Sepya</option>
+      <option value="yesil" data-i18n="eye_yesil">Yeşilimsi</option>
+      <option value="pembe" data-i18n="eye_pembe">Pembe</option>
+      <option value="gece" data-i18n="eye_gece">Gece</option>
+      <option value="koyu_gece" data-i18n="eye_koyu_gece">Koyu Gece</option>
+      <option value="karartma" data-i18n="eye_karartma">Karartma</option>
+    </select>
+    <button class="btn btn-icon" id="btn-fullscreen" data-i18n-title="tip_fullscreen">⛶</button>
+    <button class="btn btn-icon" id="btn-panel" data-i18n-title="tip_panel">🗨</button>
+  </div>
+
+  <div class="tb-group">
+    <div class="locale-switch" role="group" aria-label="Arayüz dili">
+      <button class="locale-btn is-active" data-locale="tr">TR</button>
+      <button class="locale-btn" data-locale="en">EN</button>
+    </div>
+  </div>
+</header>
+
+<div class="search-bar" id="search-bar" hidden>
+  <input type="search" id="search-input" class="search-input"
+         data-i18n-placeholder="search_placeholder" placeholder="Belgede ara…">
+  <span class="search-status" id="search-status"></span>
+  <button class="btn btn-icon" id="btn-search-prev" data-i18n-title="tip_search_prev">‹</button>
+  <button class="btn btn-icon" id="btn-search-next" data-i18n-title="tip_search_next">›</button>
+  <button class="btn btn-icon" id="btn-search-close" data-i18n-title="tip_search_close">✕</button>
+</div>
+
+<main class="workspace" id="workspace">
+  <aside class="sidebar" id="sidebar" hidden>
+    <div class="sidebar-head">
+      <h2 data-i18n="bookmarks_title">Yer İşaretleri</h2>
+      <div class="sidebar-actions">
+        <button class="btn btn-ghost btn-sm" id="btn-bm-expand" data-i18n="bm_expand_all">＋ Hepsini Aç</button>
+        <button class="btn btn-ghost btn-sm" id="btn-bm-collapse" data-i18n="bm_collapse_all">－ Hepsini Kapat</button>
+      </div>
+    </div>
+    <div class="sidebar-body" id="bookmark-tree"></div>
+  </aside>
+
+  <section class="viewer" id="viewer" tabindex="0">
+    <div class="eye-tint" id="eye-tint" aria-hidden="true"></div>
+  </section>
+
+  <div class="dropzone" id="dropzone">
+    <div class="dropzone-inner">
+      <img src="assets/icon.png" alt="" width="72" height="72">
+      <h1 data-i18n="drop_title">PDF dosyanızı buraya bırakın</h1>
+      <p class="dz-hint" data-i18n="drop_hint">ya da tıklayıp seçin — dosyanız bilgisayarınızdan çıkmaz</p>
+      <p class="dz-privacy" data-i18n="drop_privacy">Tüm işlem tarayıcınızda yapılır. Hiçbir dosya sunucuya yüklenmez.</p>
+    </div>
+  </div>
+
+  <div class="panel-resizer" id="panel-resizer" hidden
+       role="separator" aria-orientation="vertical" tabindex="0"
+       data-i18n-title="tip_panel_resize" title="Paneli yeniden boyutlandır"></div>
+
+  <aside class="panel" id="panel" hidden>
+    <div class="panel-head">
+      <h2 data-i18n="panel_title">Çeviri</h2>
+      <div class="panel-langs">
+        <label class="field">
+          <span data-i18n="lbl_source">Kaynak</span>
+          <select class="select" id="source-select">
+            <option value="auto" data-i18n="src_auto">Otomatik</option>
+            <option value="en">EN</option>
+            <option value="tr">TR</option>
+            <option value="de">DE</option>
+            <option value="fr">FR</option>
+            <option value="es">ES</option>
+            <option value="ru">RU</option>
+          </select>
+        </label>
+        <label class="field">
+          <span data-i18n="lbl_target">Hedef dil</span>
+          <select class="select" id="target-select">
+            <option value="tr">TR</option>
+            <option value="en">EN</option>
+            <option value="de">DE</option>
+            <option value="fr">FR</option>
+            <option value="es">ES</option>
+            <option value="ru">RU</option>
+          </select>
+        </label>
+      </div>
+    </div>
+
+    <div class="panel-body">
+      <p class="panel-empty" id="panel-empty" data-i18n="panel_empty">
+        PDF üzerinde bir metin seçin — çevirisi burada görünür.
+      </p>
+
+      <div class="panel-section" id="panel-content" hidden>
+        <div class="section-head">
+          <h3 data-i18n="panel_original">Özgün metin</h3>
+        </div>
+        <div class="text-box" id="text-original"></div>
+
+        <div class="section-head">
+          <h3 data-i18n="panel_translated">Çeviri</h3>
+          <button class="btn btn-ghost btn-sm" id="btn-copy" data-i18n="btn_copy">Kopyala</button>
+        </div>
+        <div class="text-box text-translated" id="text-translated"></div>
+
+        <p class="panel-hint" data-i18n="panel_hint_hover">
+          Panelde bir cümlenin üzerine gelin, PDF’de nerede olduğu vurgulanır.
+        </p>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<button class="floating-translate" id="floating-translate" hidden data-i18n="btn_translate">Çevir</button>
+
+<div class="toast" id="toast" hidden></div>
+
+<div class="progress" id="progress" hidden>
+  <div class="progress-bar" id="progress-bar"></div>
+  <span class="progress-label" id="progress-label"></span>
+</div>
+
+<div class="boot-error" id="boot-error" hidden></div>
+
+<script>
+// Failure reporter. A module that fails to load does so silently — the page
+// renders, nothing works, and the reason sits in a console the user never
+// opens. This surfaces it on screen instead. Deliberately a classic script so
+// it runs even when module loading is what broke.
+(function () {
+  var bar = document.getElementById('boot-error');
+  var shown = false;
+
+  function show(message) {
+    if (shown) return;
+    shown = true;
+    bar.hidden = false;
+    bar.textContent = message;
+  }
+
+  // The module script below reports through this, so its precise message is
+  // not later overwritten by the generic timeout notice.
+  window.__lucidBootFail = show;
+
+  window.addEventListener('error', function (event) {
+    if (event.target && event.target !== window && event.target.tagName) {
+      show(
+        'Dosya yüklenemedi: ' + (event.target.src || event.target.href || '?') +
+        ' — sayfayı start.bat ile açtığınızdan emin olun.'
+      );
+    } else {
+      show('Hata: ' + (event.message || event.error));
+    }
+  }, true);
+
+  window.addEventListener('unhandledrejection', function (event) {
+    var reason = event.reason;
+    show('Hata: ' + (reason && reason.message ? reason.message : String(reason)));
+  });
+
+  setTimeout(function () {
+    if (!window.LucidLector) {
+      show(
+        'Uygulama 5 saniyede başlamadı — betikler hâlâ yükleniyor olabilir. ' +
+        'Sayfayı yenileyin (Ctrl+F5). Sürerse F12 → Console ve Network ' +
+        'sekmesinde bekleyen (pending) istek var mı bakın.'
+      );
+    }
+  }, 5000);
+})();
+</script>
+
+<script type="module">
+// Imported dynamically rather than via `<script src>` so that a failure has a
+// message. When a static module script fails, the browser fires a bare error
+// event naming only the entry file, even if the real culprit is something it
+// imports. A rejected dynamic import names the file that actually failed.
+import('./js/app.js').catch(function (err) {
+  window.__lucidBootFail(
+    'Uygulama yüklenemedi — ' + (err && err.message ? err.message : String(err)) +
+    '  |  Sunucu: ' + location.origin
+  );
+});
+</script>
+</body>
+</html>
