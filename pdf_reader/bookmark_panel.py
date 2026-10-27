@@ -13,6 +13,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import s as _s
+
 
 class _BookmarkTree(QTreeWidget):
     """QTreeWidget that expands/collapses full subtrees on ←/→."""
@@ -181,12 +183,15 @@ class BookmarkPanel(QWidget):
         items: list[tuple[int, QTreeWidgetItem]] = []
         self._collect(self._tree.invisibleRootItem(), items)
 
+        # Last entry at or before the current page. No early break: document
+        # order is usually monotonic in page number, but a malformed TOC can
+        # break that and stopping at the first larger value would skip the
+        # correct heading.
         best: QTreeWidgetItem | None = None
+        best_page = -1
         for item_page, item in items:
-            if item_page <= page:
-                best = item
-            elif item_page > page:
-                break
+            if best_page <= item_page <= page:
+                best, best_page = item, item_page
 
         if best is None:
             return
@@ -198,13 +203,9 @@ class BookmarkPanel(QWidget):
 
     def set_locale(self, code: str) -> None:
         """Update localised strings for *code*."""
-        from .i18n import s as _s
         self._empty.setText(_s(code, "bookmarks_empty"))
         self._btn_expand.setText(_s(code, "bm_expand_all"))
         self._btn_collapse.setText(_s(code, "bm_collapse_all"))
-
-    def set_eye_filter(self, color: object | None) -> None:
-        """Not used visually; kept for API symmetry with other panels."""
 
     # ------------------------------------------------------------------ #
     # Private helpers

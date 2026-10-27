@@ -1,7 +1,6 @@
-"""Entry point for AkinelPDF."""
+"""Entry point for LucidLectorPDF."""
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 

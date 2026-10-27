@@ -8,7 +8,7 @@ from . import __version__
 from .i18n import s as _s
 
 import fitz
-from PyQt6.QtCore import QSettings, Qt
+from PyQt6.QtCore import QSettings, Qt, QThreadPool
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -42,6 +42,20 @@ from .recent_files import RecentFiles
 from .search_bar import SearchBar
 from .translation_popup import TranslationPanel
 from .translator import LANGUAGES, Translator
+
+
+# Eye-protection tints painted over the page (and the translation panel).
+# "off" is absent on purpose: a missing entry means no overlay.
+EYE_FILTER_COLORS: dict[str, QColor] = {
+    "hafif":     QColor(255, 210, 140,  30),
+    "warm":      QColor(255, 220, 150,  55),
+    "sepia":     QColor(245, 220, 180,  75),
+    "yesil":     QColor( 80, 200,  80,  38),
+    "pembe":     QColor(255, 160, 180,  45),
+    "gece":      QColor(255, 130,  60, 110),
+    "koyu_gece": QColor(255, 100,  30, 155),
+    "karartma":  QColor(  0,   0,   0,  90),
+}
 
 
 class MainWindow(QMainWindow):
@@ -269,7 +283,9 @@ class MainWindow(QMainWindow):
         self._act_paragraph.setCheckable(True)
         self._act_paragraph.setShortcut(QKeySequence("Ctrl+P"))
         self._act_paragraph.setToolTip("Paragraf başlarına çeviri butonu ekler (Ctrl+P)")
-        self._act_paragraph.toggled.connect(self._view.set_paragraph_mode)
+        self._act_paragraph.toggled.connect(
+            lambda on: self._active_view.set_paragraph_mode(on)
+        )
         self._menu_view.addAction(self._act_paragraph)
 
         self._menu_view.addSeparator()
@@ -283,7 +299,9 @@ class MainWindow(QMainWindow):
         self._act_dual = QAction("İkili Görünüm", self)
         self._act_dual.setCheckable(True)
         self._act_dual.setShortcut(QKeySequence("Ctrl+2"))
-        self._act_dual.toggled.connect(self._view.set_dual_view)
+        # NOT: set_dual_view çağrısı _set_view_mode üzerinden yapılır
+        # (_build_toolbar içinde bağlanır). Burada ikinci kez bağlamak
+        # her geçişte çift çağrıya yol açıyordu.
         self._menu_view.addAction(self._act_dual)
 
         self._act_split = QAction("Bölünmüş Görünüm", self)
@@ -447,20 +465,28 @@ class MainWindow(QMainWindow):
 
     def _wire(self) -> None:
         self._search.search_requested.connect(self._run_search)
-        self._search.next_requested.connect(self._view.search_next)
-        self._search.prev_requested.connect(self._view.search_prev)
-        self._search.closed.connect(self._view.clear_search)
+        self._search.next_requested.connect(lambda: self._active_view.search_next())
+        self._search.prev_requested.connect(lambda: self._active_view.search_prev())
+        # Closing the bar must clear EVERY panel, not just the active one: the
+        # user may have searched in one panel and then clicked into the other,
+        # and orphaned match overlays survive scrolling and zooming.
+        self._search.closed.connect(self._clear_all_searches)
 
         self._view.translate_requested.connect(self._on_translate)
         self._view.highlight_requested.connect(self._on_highlight)
         self._view.underline_requested.connect(self._on_underline)
         self._view.delete_annotation_requested.connect(self._on_delete_annotation)
+        self._view.render_failed.connect(self._on_render_failed)
 
         self._translator.translated.connect(self._show_translation)
         self._translator.failed.connect(self._translation_failed)
 
-        self._translation_panel.sentence_hovered.connect(self._view.show_hover_highlight)
-        self._translation_panel.sentence_left.connect(self._view.clear_hover_highlight)
+        self._translation_panel.sentence_hovered.connect(
+            lambda text: self._active_view.show_hover_highlight(text)
+        )
+        self._translation_panel.sentence_left.connect(
+            lambda: self._active_view.clear_hover_highlight()
+        )
 
         self._view.pdf_sentence_hovered.connect(self._translation_panel.highlight_sentence)
         self._view.pdf_sentence_left.connect(self._translation_panel.clear_sentence_highlight)
@@ -709,21 +735,10 @@ class MainWindow(QMainWindow):
     # Eye filter
     # ================================================================== #
     def _set_eye_filter(self, mode: str) -> None:
-        colors: dict[str, QColor] = {
-            "hafif":     QColor(255, 210, 140,  30),
-            "warm":      QColor(255, 220, 150,  55),
-            "sepia":     QColor(245, 220, 180,  75),
-            "yesil":     QColor( 80, 200,  80,  38),
-            "pembe":     QColor(255, 160, 180,  45),
-            "gece":      QColor(255, 130,  60, 110),
-            "koyu_gece": QColor(255, 100,  30, 155),
-            "karartma":  QColor(  0,   0,   0,  90),
-        }
-        color = colors.get(mode)
+        color = EYE_FILTER_COLORS.get(mode)
         self._current_eye_mode = mode
-        self._view.set_eye_filter(color)
-        if self._view2 is not None:
-            self._view2.set_eye_filter(color)
+        for view in self._panels():
+            view.set_eye_filter(color)
         self._translation_panel.set_eye_filter(color)
         self._settings.setValue("eyeFilter", mode)
 
@@ -731,7 +746,7 @@ class MainWindow(QMainWindow):
     # View mode
     # ================================================================== #
     def _set_view_mode(self, dual: bool) -> None:
-        self._view.set_dual_view(dual)
+        self._active_view.set_dual_view(dual)
         if self._act_dual.isChecked() != dual:
             self._act_dual.setChecked(dual)
         if dual and not self._act_dual_tb.isChecked():
@@ -765,6 +780,28 @@ class MainWindow(QMainWindow):
         self._bookmark_panel.set_document(self._active_view.doc)
         if self._active_view.doc is not None:
             self._bookmark_panel.highlight_current(self._active_view.current_page())
+        self._sync_view_mode_actions()
+
+    def _sync_view_mode_actions(self) -> None:
+        """Reflect the active panel's own view state in the checkable actions.
+
+        The dual-view and paragraph-mode toggles act on the active panel, so
+        when the user switches panels the checkboxes must follow that panel
+        instead of keeping the previous one's state.
+        """
+        v = self._active_view
+        for action, state in (
+            (self._act_dual, v.is_dual_view()),
+            (self._act_paragraph, v.is_paragraph_mode()),
+        ):
+            if action.isChecked() != state:
+                action.blockSignals(True)
+                action.setChecked(state)
+                action.blockSignals(False)
+        # Toolbar mirrors are driven by signals we just blocked — set directly.
+        self._act_dual_tb.setChecked(v.is_dual_view())
+        self._act_single_tb.setChecked(not v.is_dual_view())
+        self._act_paragraph_tb.setChecked(v.is_paragraph_mode())
 
     def _toggle_split(self, checked: bool) -> None:
         """Open or close the second panel next to the main view."""
@@ -786,6 +823,7 @@ class MainWindow(QMainWindow):
             v2.highlight_requested.connect(self._on_highlight)
             v2.underline_requested.connect(self._on_underline)
             v2.delete_annotation_requested.connect(self._on_delete_annotation)
+            v2.render_failed.connect(self._on_render_failed)
             v2.pdf_sentence_hovered.connect(
                 self._translation_panel.highlight_sentence
             )
@@ -794,17 +832,7 @@ class MainWindow(QMainWindow):
             )
             # Apply current UI state to the new panel
             v2.set_locale(self._locale)
-            colors: dict[str, "QColor"] = {
-                "hafif":     QColor(255, 210, 140,  30),
-                "warm":      QColor(255, 220, 150,  55),
-                "sepia":     QColor(245, 220, 180,  75),
-                "yesil":     QColor( 80, 200,  80,  38),
-                "pembe":     QColor(255, 160, 180,  45),
-                "gece":      QColor(255, 130,  60, 110),
-                "koyu_gece": QColor(255, 100,  30, 155),
-                "karartma":  QColor(  0,   0,   0,  90),
-            }
-            v2.set_eye_filter(colors.get(self._current_eye_mode))
+            v2.set_eye_filter(EYE_FILTER_COLORS.get(self._current_eye_mode))
             # Initialise per-panel state for the new panel
             self._panel_paths[id(v2)] = None
             self._panel_dirty[id(v2)] = False
@@ -829,6 +857,7 @@ class MainWindow(QMainWindow):
             self._panel_dirty.pop(id(self._view2), None)
             self._undo_stacks.pop(id(self._view2), None)
             self._redo_stacks.pop(id(self._view2), None)
+            self._view2.shutdown()        # no worker left touching this panel
             self._view2.clear()
             self._view2.setParent(None)   # type: ignore[arg-type]
             self._view2.deleteLater()
@@ -839,11 +868,16 @@ class MainWindow(QMainWindow):
             self._sync_page_input()
             self._update_status()
             self._update_title()
+            # The toggles and side panels now follow the primary panel again.
+            self._sync_view_mode_actions()
+            self._bookmark_panel.set_document(self._view.doc)
+            if self._view.doc is not None:
+                self._bookmark_panel.highlight_current(self._view.current_page())
 
     def _rotate_pages(self, delta: int = 90) -> None:
-        if self._view.doc is None:
+        if self._active_view.doc is None:
             return
-        self._view.rotate(delta)
+        self._active_view.rotate(delta)
         self._document_dirty = True
 
     def _toggle_fullscreen(self) -> None:
@@ -873,11 +907,20 @@ class MainWindow(QMainWindow):
         self._search.show()
         self._search.focus_input()
 
+    def _panels(self) -> list["PdfView"]:
+        """Every live panel, primary first."""
+        return [v for v in (self._view, self._view2) if v is not None]
+
+    def _clear_all_searches(self) -> None:
+        for view in self._panels():
+            view.clear_search()
+
     def _run_search(self, query: str) -> None:
-        if self._view.doc is None:
+        view = self._active_view
+        if view.doc is None:
             return
-        results = self._view.doc.search(query)
-        count = self._view.apply_search(results)
+        results = view.doc.search(query)
+        count = view.apply_search(results)
         self._search.set_match_count(count)
 
     # ================================================================== #
@@ -891,11 +934,19 @@ class MainWindow(QMainWindow):
 
     def _show_translation(self, original: str, translated: str) -> None:
         self._last_original = original          # remember for re-translate on lang change
-        self._view.clear_hover_highlight()      # reset stale hover from previous translation
-        self._view.set_translation_context(original)
+        view = self._active_view
+        view.clear_hover_highlight()            # reset stale hover from previous translation
+        view.set_translation_context(original)
         self._translation_panel.set_content(original, translated)
         self._translation_dock.show()
         self._translation_dock.raise_()
+
+    def _on_render_failed(self, page_index: int, err: str) -> None:
+        """A page could not be rendered — tell the user instead of showing grey."""
+        self.statusBar().showMessage(
+            _s(self._locale, "status_render_fail").format(page=page_index + 1, err=err),
+            6000,
+        )
 
     def _translation_failed(self, _original: str, err: str) -> None:
         QMessageBox.warning(
@@ -909,16 +960,13 @@ class MainWindow(QMainWindow):
     # ================================================================== #
     def _rerender_page(self, page_index: int) -> None:
         """Re-render *page_index* in the active view.
-        Also mirrors to the other panel if both panels show the same file."""
+
+        No mirroring to the other panel: each panel opens its own PdfDocument
+        (see _toggle_split), so an annotation added here does not exist in the
+        other panel's in-memory document and re-rendering it would only repaint
+        an identical page.
+        """
         self._active_view.rerender_page(page_index)
-        other = self._view2 if self._active_view is self._view else self._view
-        if (
-            other is not None
-            and other.doc is not None
-            and self._active_view.doc is not None
-            and str(other.doc.path) == str(self._active_view.doc.path)
-        ):
-            other.rerender_page(page_index)
 
     def _on_highlight(self, page_index: int, rects: list) -> None:
         self._add_annotation("highlight", page_index, rects)
@@ -1118,13 +1166,21 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         # Prompt save for both panels (primary first, then secondary if present)
         saved_active = self._active_view
-        for view in [v for v in [self._view, self._view2] if v is not None]:
+        for view in self._panels():
             self._active_view = view
             if not self._prompt_save():
                 self._active_view = saved_active
                 event.ignore()
                 return
         self._active_view = saved_active
+        # Shut the render pipeline down before the widgets go away, so no
+        # worker is still emitting into a half-torn-down interpreter. clear()
+        # additionally closes the fitz handles.
+        for view in self._panels():
+            view.shutdown()
+            view.clear()
+        # Translations still run on the global pool.
+        QThreadPool.globalInstance().waitForDone(3000)
         super().closeEvent(event)
 
     # ================================================================== #

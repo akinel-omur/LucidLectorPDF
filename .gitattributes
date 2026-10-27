@@ -1,0 +1,18 @@
+# Normalise line endings so Windows checkouts stop producing diffs that are
+# pure CRLF churn. Run once after adding this file:
+#     git add --renormalize .
+#     git commit -m "chore: normalize line endings"
+
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF to run reliably.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Never touch binaries.
+*.png   binary
+*.ico   binary
+*.pdf   binary
+*.exe   binary
+*.pyc   binary

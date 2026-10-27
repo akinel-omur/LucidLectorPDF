@@ -1,8 +1,6 @@
 """Translation panel — shown in a right-side dock widget."""
 from __future__ import annotations
 
-import re
-
 from PyQt6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QGuiApplication, QPainter, QTextCursor
 from PyQt6.QtWidgets import (
@@ -15,63 +13,21 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import s as _s
+from .text_utils import (
+    MIN_SENTENCE_LENGTH,
+    sentence_at,
+    sentence_boundaries,
+    sentence_index_of,
+)
+
 # Same teal as PdfView.HOVER_COLOR — keep both panes in sync visually.
 _HOVER_HIGHLIGHT_COLOR = QColor(50, 210, 180, 130)
-
-from .i18n import s as _s
 
 _FONT_KEY = "translationFontSize"
 _DEFAULT_SIZE = 11
 _MIN_SIZE = 8
 _MAX_SIZE = 36
-
-
-# ---------- sentence helpers ----------
-
-def _sentence_boundaries(text: str) -> list[tuple[int, int]]:
-    """Return [(start, end), …] char offsets for each sentence in *text*."""
-    result: list[tuple[int, int]] = []
-    start = 0
-    for m in re.finditer(r'(?<=[.!?…])\s+', text):
-        result.append((start, m.start() + 1))   # include trailing punctuation
-        start = m.end()
-    if start < len(text):
-        result.append((start, len(text)))
-    return result
-
-
-def _sentence_at(text: str, pos: int) -> str:
-    """Return the sentence in *text* that contains character offset *pos*."""
-    for start, end in _sentence_boundaries(text):
-        if start <= pos < end:
-            return text[start:end].strip()
-    return text.strip()   # fallback: whole text is one sentence
-
-
-def _sentence_index_of(text: str, target: str) -> int | None:
-    """Index (0-based) of the sentence in *text* whose stripped form equals *target*.
-    Falls back to the first sentence containing *target* as a substring."""
-    target = target.strip()
-    if not target:
-        return None
-    bounds = _sentence_boundaries(text)
-    for i, (s, e) in enumerate(bounds):
-        if text[s:e].strip() == target:
-            return i
-    for i, (s, e) in enumerate(bounds):
-        if target in text[s:e]:
-            return i
-    return None
-
-
-def _nth_sentence(text: str, n: int) -> str:
-    """Return the *n*-th sentence (0-based) of *text*."""
-    bounds = _sentence_boundaries(text)
-    if not bounds:
-        return text.strip()
-    s, e = bounds[min(n, len(bounds) - 1)]
-    return text[s:e].strip()
-
 
 
 # ---------- eye overlay ----------
@@ -191,7 +147,7 @@ class TranslationPanel(QWidget):
             self.clear_sentence_highlight()
             return
         orig_text = self._orig.toPlainText()
-        idx = _sentence_index_of(orig_text, sentence_text)
+        idx = sentence_index_of(orig_text, sentence_text)
         if idx is None:
             self.clear_sentence_highlight()
             return
@@ -199,7 +155,7 @@ class TranslationPanel(QWidget):
         # Map to the same-index sentence in the translated text; if the
         # translation has fewer sentences, use the closest available one.
         tr_text = self._tr.toPlainText()
-        tr_bounds = _sentence_boundaries(tr_text)
+        tr_bounds = sentence_boundaries(tr_text)
         if tr_bounds:
             tr_idx = min(idx, len(tr_bounds) - 1)
             self._apply_sentence_highlight(self._tr, tr_idx)
@@ -212,7 +168,7 @@ class TranslationPanel(QWidget):
 
     @staticmethod
     def _apply_sentence_highlight(editor: QPlainTextEdit, sentence_idx: int) -> None:
-        bounds = _sentence_boundaries(editor.toPlainText())
+        bounds = sentence_boundaries(editor.toPlainText())
         if not bounds or sentence_idx < 0 or sentence_idx >= len(bounds):
             editor.setExtraSelections([])
             return
@@ -267,7 +223,7 @@ class TranslationPanel(QWidget):
         char_pos = cursor.position()
 
         if widget is self._orig:
-            sentence = _sentence_at(orig_text, char_pos)
+            sentence = sentence_at(orig_text, char_pos)
         else:
             # Translated area: map cursor position proportionally to the
             # original text — more robust than index mapping when translation
@@ -277,10 +233,12 @@ class TranslationPanel(QWidget):
                 return
             proportion = char_pos / max(len(tr_text) - 1, 1)
             orig_pos = min(int(proportion * len(orig_text)), len(orig_text) - 1)
-            sentence = _sentence_at(orig_text, orig_pos)
+            sentence = sentence_at(orig_text, orig_pos)
 
-        # Minimum length guard — ignore very short fragments (headings, numbers…)
-        if len(sentence) < 10:
+        # Ignore very short fragments (headings, numbers…). Same threshold the
+        # PDF side uses, so a sentence hoverable in one pane is hoverable in
+        # the other.
+        if len(sentence) < MIN_SENTENCE_LENGTH:
             return
 
         if sentence != self._last_hover_sentence:

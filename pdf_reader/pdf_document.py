@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -39,6 +40,12 @@ class PdfDocument:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.doc = fitz.open(self.path)
+        if self.doc.needs_pass:
+            # fitz.open() succeeds on an encrypted file, but every page access
+            # then raises deep inside rendering where nothing catches it.
+            # Fail here instead, where the caller's error dialog can report it.
+            self.doc.close()
+            raise ValueError("PDF parola korumalı; şifresi çözülmeden açılamıyor.")
         self._page_size_cache: dict[int, tuple[float, float]] = {}
         self._words_cache: dict[int, list[Word]] = {}
         self._paragraphs_cache: list[dict] | None = None
@@ -172,13 +179,25 @@ class PdfDocument:
         return self._paragraphs_by_page.get(page_index, [])
 
     def search(self, query: str) -> dict[int, list[fitz.Rect]]:
-        """Return {page_index: [rects]} for all matches."""
+        """Return {page_index: [rects]} for all matches in the whole document.
+
+        Only appropriate for an explicit Ctrl+F search — this walks every page.
+        For anything driven by mouse movement use :meth:`search_pages`.
+        """
+        return self.search_pages(query, range(self.page_count))
+
+    def search_pages(
+        self, query: str, pages: Iterable[int]
+    ) -> dict[int, list[fitz.Rect]]:
+        """Return {page_index: [rects]} for matches on *pages* only."""
         results: dict[int, list[fitz.Rect]] = {}
         if not query:
             return results
-        for i in range(self.page_count):
-            page = self.doc[i]
-            rects = page.search_for(query, quads=False)
+        last = self.page_count - 1
+        for i in pages:
+            if not 0 <= i <= last:
+                continue
+            rects = self.doc[i].search_for(query, quads=False)
             if rects:
                 results[i] = rects
         return results

@@ -13,12 +13,10 @@ from PyQt6.QtGui import (
     QGuiApplication,
     QImage,
     QPainter,
-    QPainterPath,
     QPen,
     QPixmap,
 )
 from PyQt6.QtWidgets import (
-    QGraphicsItemGroup,
     QGraphicsObject,
     QGraphicsPixmapItem,
     QGraphicsRectItem,
@@ -28,10 +26,39 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from .i18n import s as _s
+from .pdf_document import PdfDocument, Word
+from .text_utils import MIN_SENTENCE_LENGTH, search_variants, sentences
+
+
+_RENDER_POOL: QThreadPool | None = None
+
+
+def _render_pool() -> QThreadPool:
+    """The thread pool used for page rendering, created on first use.
+
+    Deliberately not QThreadPool.globalInstance(): the translator submits there
+    too and its network calls have no timeout, so a few stalled translations
+    used to starve page rendering completely. Equally deliberately shared by
+    every PdfView rather than one pool per view — with a split view, per-view
+    pools would oversubscribe the CPU with twice the render threads.
+    """
+    global _RENDER_POOL
+    if _RENDER_POOL is None:
+        _RENDER_POOL = QThreadPool()
+        _RENDER_POOL.setMaxThreadCount(
+            max(2, QThreadPool.globalInstance().maxThreadCount() - 1)
+        )
+    return _RENDER_POOL
+
 
 class _RenderSignals(QObject):
-    """Carry a finished page render back to the main thread."""
-    done = pyqtSignal(int, object)   # page_index, QImage
+    """Carry a finished (or failed) page render back to the main thread."""
+    # Both carry (page_index, payload, generation) — keeping the argument order
+    # identical means a mixed-up connection fails loudly instead of silently
+    # swapping two same-typed ints.
+    done = pyqtSignal(int, object, int)    # page_index, QImage, generation
+    failed = pyqtSignal(int, str, int)     # page_index, error message, generation
 
 
 class _PageRenderTask(QRunnable):
@@ -58,18 +85,27 @@ class _PageRenderTask(QRunnable):
     def run(self) -> None:  # noqa: D102
         doc = None
         try:
-            import fitz as _fitz  # noqa: PLC0415
-            doc = _fitz.open(self._path)
+            doc = fitz.open(self._path)
+            if doc.needs_pass:
+                raise ValueError("Belge parola korumalı.")
             page = doc[self._page_index]
-            matrix = _fitz.Matrix(self._zoom * self._k, self._zoom * self._k)
+            matrix = fitz.Matrix(self._zoom * self._k, self._zoom * self._k)
             pix = page.get_pixmap(matrix=matrix, alpha=False)
             img = QImage(
                 pix.samples, pix.width, pix.height, pix.stride,
                 QImage.Format.Format_RGB888,
             ).copy()   # detach from pix buffer before doc.close()
-            doc.close()
-            self._signals.done.emit(self._page_index, img)
-        except Exception:  # noqa: BLE001
+            self._signals.done.emit(self._page_index, img, self._generation)
+        except Exception as e:  # noqa: BLE001
+            # Must still report back: the view keeps this page in
+            # _pending_renders and would never retry it otherwise.
+            try:
+                self._signals.failed.emit(self._page_index, str(e), self._generation)
+            except Exception:  # noqa: BLE001
+                # An exception escaping run() is fatal under PyQt (qFatal),
+                # so the reporting path must never raise either.
+                pass
+        finally:
             if doc is not None:
                 try:
                     doc.close()
@@ -187,15 +223,12 @@ class AutoscrollIndicator(QWidget):
         p.setBrush(QBrush(QColor(40, 40, 40)))
         p.drawEllipse(int(cx - 2.5), int(cy - 2.5), 5, 5)
 
-from .i18n import s as _s
-from .pdf_document import PdfDocument, Word
-from .translation_popup import _sentence_boundaries
-
-
 PAGE_GAP = 12  # pixels between pages in scene
 RENDER_KEEP_VIEWPORTS = 3  # keep rendered pages within this many viewport heights
 RENDER_LOAD_VIEWPORTS = 1   # pre-render pages just outside the visible viewport
 MERGED_PARAGRAPH_PAGE_LIMIT = 300
+MAX_RENDER_ATTEMPTS = 3      # give up on a page after this many failed renders
+RENDER_RETRY_DELAY_MS = 400  # wait between attempts; transient locks clear fast
 SELECTION_COLOR    = QColor( 80, 140, 255,  90)
 HIGHLIGHT_COLOR    = QColor(255, 230,   0, 110)
 SEARCH_COLOR       = QColor(255, 235,   0, 140)
@@ -221,6 +254,7 @@ class PdfView(QGraphicsView):
     underline_requested = pyqtSignal(int, list)  # page_index, list[fitz.Rect]
     delete_annotation_requested = pyqtSignal(int, object)  # page_index, (x, y)
     page_changed = pyqtSignal(int)
+    render_failed = pyqtSignal(int, str)     # page_index, error message
     pdf_sentence_hovered = pyqtSignal(str)   # sentence text under cursor
     pdf_sentence_left = pyqtSignal()
     panel_activated = pyqtSignal()           # any mouse press — marks this panel as active
@@ -239,7 +273,6 @@ class PdfView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
         self.doc: PdfDocument | None = None
-        self._owns_doc: bool = True     # False when doc is shared (split view)
         self._zoom: float = 1.0
         self._render_scale: float = 2.0   # oversample for crisp rendering
         self._dual_view: bool = False
@@ -263,10 +296,10 @@ class PdfView(QGraphicsView):
         self._eye_filter_color: QColor | None = None
         self._locale: str = "tr"
         self._hover_items: list[QGraphicsRectItem] = []
-        # PDF→panel hover: rects of every sentence in the active translation,
-        # keyed by sentence text so we can both detect hover and reuse rects
-        # for the on-PDF teal highlight without re-running search().
-        self._sentence_rects: list[tuple[int, fitz.Rect, str]] = []
+        # PDF→panel hover. The sentences of the active translation, plus their
+        # rects resolved lazily per page (page_index → [(rect, sentence), …]).
+        self._context_sentences: list[str] = []
+        self._sentence_rects_by_page: dict[int, list[tuple[fitz.Rect, str]]] = {}
         self._last_pdf_hover_sentence: str = ""
         # Always-on hover detection — required for mouseMoveEvent to fire
         # without a button held down.
@@ -289,7 +322,20 @@ class PdfView(QGraphicsView):
         # Async rendering support
         self._pending_renders: set[int] = set()       # pages currently in the thread pool
         self._render_generation: int = 0              # bumped on rebuild/zoom to discard stale results
-        self._render_pool: QThreadPool = QThreadPool.globalInstance()
+        self._render_pool = _render_pool()
+        # page_index → (attempts so far, last error message)
+        self._failed_renders: dict[int, tuple[int, str]] = {}
+        # One long-lived signal relay shared by every render task. Created on
+        # the main thread, so worker-thread emits arrive as queued connections.
+        # Deliberately NOT parented to this view: an in-flight task holds a
+        # reference to it, and if Qt destroyed it together with the widget
+        # (e.g. the split panel being closed mid-render) that task would emit
+        # on a dead C++ object. Without a parent the Python reference keeps it
+        # alive, and Qt drops the connections by itself once the receiving
+        # view is destroyed, so late emits are simply ignored.
+        self._render_signals = _RenderSignals()
+        self._render_signals.done.connect(self._on_page_ready)
+        self._render_signals.failed.connect(self._on_page_failed)
 
         self.setBackgroundBrush(QBrush(QColor(Qt.GlobalColor.black)))
         self._scene.setBackgroundBrush(QBrush(QColor(Qt.GlobalColor.black)))
@@ -299,26 +345,30 @@ class PdfView(QGraphicsView):
     # ---------- document ----------
     def load(self, doc: PdfDocument) -> None:
         self.clear()
-        self._owns_doc = True
         self.doc = doc
         self._current_spread_start = 0
         self._rebuild()
 
-    def load_shared(self, doc: PdfDocument) -> None:
-        """Load *doc* without taking ownership — the caller owns the document lifecycle.
+    def shutdown(self) -> None:
+        """Stop rendering and wait for in-flight tasks.
 
-        Used by the split-view secondary panel so both panels share one fitz handle.
+        Call before this view is torn down (split panel closed, application
+        quitting) so no worker is still touching the document afterwards. The
+        pool is shared, so this briefly waits on the other panel's tasks too;
+        they are re-queued on the next scroll.
         """
-        self.clear()          # resets _owns_doc → True; next line overrides it
-        self._owns_doc = False
-        self.doc = doc
-        self._current_spread_start = 0
-        self._rebuild()
+        self._render_generation += 1
+        self._render_update_timer.stop()
+        self._render_pool.clear()        # drop queued tasks that never started
+        self._render_pool.waitForDone(3000)
+        self._pending_renders.clear()
+        self._failed_renders.clear()
 
     def clear(self) -> None:
         # Discard any in-flight renders before clearing state.
         self._render_generation += 1
         self._pending_renders.clear()
+        self._failed_renders.clear()
         self._render_update_timer.stop()
 
         self._scene.clear()
@@ -333,20 +383,22 @@ class PdfView(QGraphicsView):
         self._selected_rects_by_page.clear()
         # Scene.clear() destroys these items; drop dangling Python refs too.
         self._paragraph_markers.clear()
+        self._active_paragraph_marker = None
+        self._hover_items.clear()
         self._active_search_index = -1
-        self._sentence_rects.clear()
+        self._context_sentences = []
+        self._sentence_rects_by_page.clear()
         self._last_pdf_hover_sentence = ""
         if self.doc is not None:
-            if self._owns_doc:
-                self.doc.close()
+            self.doc.close()
             self.doc = None
-        self._owns_doc = True   # reset so next load() takes ownership by default
 
     def _rebuild(self) -> None:
         assert self.doc is not None
         # Discard any in-flight renders from the previous layout.
         self._render_generation += 1
         self._pending_renders.clear()
+        self._failed_renders.clear()
 
         self._scene.clear()
         self._pages = [None] * self.doc.page_count
@@ -456,33 +508,60 @@ class PdfView(QGraphicsView):
             return
         if page_index in self._rendered_pages or page_index in self._pending_renders:
             return
+        # Retry a failed page a couple of times (transient causes like the file
+        # being briefly locked during an incremental save are common), then stop
+        # so a genuinely broken page can't flood the thread pool.
+        attempts, _ = self._failed_renders.get(page_index, (0, ""))
+        if attempts >= MAX_RENDER_ATTEMPTS:
+            return
         if page_index >= len(self._pages):
             return
         if self._pages[page_index] is None:
             return
 
         self._pending_renders.add(page_index)
-        sig = _RenderSignals()
-        gen = self._render_generation
-        sig.done.connect(
-            lambda idx, img, g=gen: self._on_page_ready(idx, img, g)
-        )
         task = _PageRenderTask(
             str(self.doc.path),
             page_index,
             self._zoom,
             self._render_scale,
-            gen,
-            sig,
+            self._render_generation,
+            self._render_signals,
         )
-        task._sig_keepalive = sig   # keep QObject alive until the slot fires  # noqa: SLF001
         self._render_pool.start(task)
 
+    def _on_page_failed(self, page_index: int, error: str, generation: int) -> None:
+        """A render task raised — release the page so it can be retried."""
+        if generation != self._render_generation:
+            return   # stale failure from before a zoom/rebuild
+        self._pending_renders.discard(page_index)
+        attempts = self._failed_renders.get(page_index, (0, ""))[0] + 1
+        self._failed_renders[page_index] = (attempts, error)
+        if attempts < MAX_RENDER_ATTEMPTS:
+            # Don't alarm the user yet — schedule the retry ourselves rather
+            # than waiting for a scroll, which may never come.
+            QTimer.singleShot(RENDER_RETRY_DELAY_MS, self._update_visible_pages)
+            return
+        self.render_failed.emit(page_index, error)
+        # Mark the placeholder so the user can tell an unrendered page from a
+        # broken one instead of staring at an identical grey rectangle.
+        ph = self._page_placeholders[page_index] if page_index < len(
+            self._page_placeholders
+        ) else None
+        if ph is not None:
+            ph.setBrush(QBrush(QColor(70, 40, 40)))
+            ph.setToolTip(
+                _s(self._locale, "status_render_fail").format(
+                    page=page_index + 1, err=error
+                )
+            )
+
     def _on_page_ready(self, page_index: int, img: object, generation: int) -> None:
-        """Called from a worker thread via signal — place the rendered page in the scene."""
+        """Queued from a worker thread — place the rendered page in the scene."""
         if generation != self._render_generation:
             return   # stale result from before a zoom/rebuild
         self._pending_renders.discard(page_index)
+        self._failed_renders.pop(page_index, None)
         if self.doc is None:
             return
         layout = self._pages[page_index]
@@ -533,6 +612,12 @@ class PdfView(QGraphicsView):
         keep = self._page_indices_near_viewport(RENDER_KEEP_VIEWPORTS)
         for page_index in list(self._rendered_pages - keep):
             self._unload_page(page_index)
+        # Scrolling a failed page out of range resets its retry budget, so a
+        # transient failure (file briefly locked, say) doesn't become permanent.
+        # A failed page never enters _rendered_pages, so this can't live in
+        # _unload_page — that loop would never reach it.
+        for page_index in [p for p in self._failed_renders if p not in keep]:
+            self._failed_renders.pop(page_index, None)
 
         if self._search_rects:
             self._redraw_search_overlays()
@@ -562,32 +647,41 @@ class PdfView(QGraphicsView):
         if self.doc is None:
             return
         text = text.strip()
-        if len(text) < 6:
+        if len(text) < MIN_SENTENCE_LENGTH:
             return
-        # Try progressively shorter queries so we always find something even
-        # when the full sentence has formatting differences vs the PDF text.
-        results = self.doc.search(text)
-        if not results:
-            # Fallback: first 8 words — more robust against whitespace/hyphen diffs
-            words = text.split()
-            if len(words) > 3:
-                short = " ".join(words[:8])
-                results = self.doc.search(short)
-        if not results:
+        # Search only around the viewport. A hover highlight is meaningless on
+        # a page the user cannot see, and scanning the whole document here used
+        # to freeze the UI on large PDFs — this runs on the GUI thread.
+        pages = sorted(self._page_indices_near_viewport(RENDER_KEEP_VIEWPORTS))
+        if not pages:
+            return
+        results: dict[int, list[fitz.Rect]] = {}
+        # Progressively shorter queries: the PDF text layer often differs from
+        # the extracted text in whitespace and hyphenation.
+        for variant in search_variants(text):
+            results = self.doc.search_pages(variant, pages)
+            if results:
+                break
+
+        scene_rects: list[QRectF] = []
+        for page_idx, rects in results.items():
+            page = self._pages[page_idx] if page_idx < len(self._pages) else None
+            if page is None:
+                continue
+            scene_rects.extend(self._pdf_rect_to_scene(page, r) for r in rects)
+        self._paint_hover_rects(scene_rects)
+
+    def _paint_hover_rects(self, scene_rects: list[QRectF]) -> None:
+        """Replace the teal hover overlay with rectangles already in scene space."""
+        self.clear_hover_highlight()
+        if not scene_rects:
             return
         pen = QPen(Qt.PenStyle.NoPen)
         brush = QBrush(HOVER_COLOR)
-        for page_idx, rects in results.items():
-            if page_idx >= len(self._pages):
-                continue
-            page = self._pages[page_idx]
-            if page is None:
-                continue
-            for r in rects:
-                sr = self._pdf_rect_to_scene(page, r)
-                item = self._scene.addRect(sr, pen, brush)
-                item.setZValue(15)
-                self._hover_items.append(item)
+        for sr in scene_rects:
+            item = self._scene.addRect(sr, pen, brush)
+            item.setZValue(15)
+            self._hover_items.append(item)
         # Force immediate repaint so the overlay appears right away.
         self.viewport().update()
 
@@ -601,53 +695,74 @@ class PdfView(QGraphicsView):
 
     # ---------- PDF→panel sentence hover ----------
     def set_translation_context(self, original: str) -> None:
-        """Cache rects for every sentence in *original* so that hovering text
-        on the PDF can drive the translation panel highlight."""
-        self._sentence_rects.clear()
+        """Remember the sentences of *original* so hovering the PDF can drive
+        the translation panel highlight.
+
+        Locating them is deferred: rects are resolved one page at a time, the
+        first time the cursor actually enters that page. Doing it eagerly meant
+        one full-document scan per sentence, which froze the UI on long PDFs.
+        """
+        self._context_sentences = sentences(original) if original else []
+        self._sentence_rects_by_page.clear()
         self._last_pdf_hover_sentence = ""
-        if not original or self.doc is None:
-            return
-        for s, e in _sentence_boundaries(original):
-            sent = original[s:e].strip()
-            if len(sent) < 8:
-                continue
-            results = self.doc.search(sent)
-            if not results:
-                # Same fallback as show_hover_highlight: try the first 8 words.
-                words = sent.split()
-                if len(words) > 3:
-                    results = self.doc.search(" ".join(words[:8]))
-            for page_idx, rects in results.items():
-                for r in rects:
-                    self._sentence_rects.append((page_idx, r, sent))
 
-    def clear_translation_context(self) -> None:
-        self._sentence_rects.clear()
-        if self._last_pdf_hover_sentence:
-            self._last_pdf_hover_sentence = ""
-            self.clear_hover_highlight()
-            self.pdf_sentence_left.emit()
+    def _sentence_rects_for_page(self, page_index: int) -> list[tuple[fitz.Rect, str]]:
+        """Rects of the context sentences on one page, computed once and cached."""
+        if self.doc is None:
+            return []   # not cached: the answer would go stale on load()
+        cached = self._sentence_rects_by_page.get(page_index)
+        if cached is not None:
+            return cached
+        found: list[tuple[fitz.Rect, str]] = []
+        for sentence in self._context_sentences:
+            for variant in search_variants(sentence):
+                rects = self.doc.search_pages(variant, (page_index,)).get(page_index)
+                if rects:
+                    found.extend((r, sentence) for r in rects)
+                    break
+        self._sentence_rects_by_page[page_index] = found
+        return found
 
-    def _sentence_at_scene_point(self, scene_pt: QPointF) -> str | None:
-        if not self._sentence_rects:
-            return None
-        for page_idx, r, text in self._sentence_rects:
-            if page_idx >= len(self._pages):
-                continue
-            page = self._pages[page_idx]
+    def _visible_page_at(self, scene_pt: QPointF) -> PageLayout | None:
+        """The visible page containing *scene_pt*, or None.
+
+        Only checks pages near the viewport. This runs on every mouse move, and
+        scanning the whole page list would be O(page count) per event — painful
+        on a thousand-page document, and pointless since a page off-screen
+        cannot be under the cursor.
+        """
+        for index in self._page_indices_near_viewport(0):
+            page = self._pages[index] if index < len(self._pages) else None
             if page is None:
                 continue
-            if self._pdf_rect_to_scene(page, r).contains(scene_pt):
-                return text
+            if QRectF(
+                page.x_offset, page.y_offset, page.width, page.height
+            ).contains(scene_pt):
+                return page
         return None
 
     def _update_pdf_hover(self, viewport_pos: QPoint) -> None:
         """Drive the translation-panel highlight based on the cursor position."""
-        if not self._sentence_rects:
+        if not self._context_sentences:
             return
         scene_pt = self.mapToScene(viewport_pos)
-        sentence = self._sentence_at_scene_point(scene_pt)
-        if sentence is None:
+        page = self._visible_page_at(scene_pt)
+        sentence, rects = "", []
+        if page is not None:
+            for rect, text in self._sentence_rects_for_page(page.index):
+                if self._pdf_rect_to_scene(page, rect).contains(scene_pt):
+                    sentence = text
+                    break
+            if sentence:
+                # Reuse the cached rects instead of searching the document
+                # again — the hovered sentence may appear more than once.
+                rects = [
+                    self._pdf_rect_to_scene(page, r)
+                    for r, t in self._sentence_rects_for_page(page.index)
+                    if t == sentence
+                ]
+
+        if not sentence:
             if self._last_pdf_hover_sentence:
                 self._last_pdf_hover_sentence = ""
                 self.clear_hover_highlight()
@@ -655,7 +770,7 @@ class PdfView(QGraphicsView):
             return
         if sentence != self._last_pdf_hover_sentence:
             self._last_pdf_hover_sentence = sentence
-            self.show_hover_highlight(sentence)   # teal overlay on PDF
+            self._paint_hover_rects(rects)
             self.pdf_sentence_hovered.emit(sentence)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
@@ -760,6 +875,8 @@ class PdfView(QGraphicsView):
         if self.doc is None:
             return
         self.doc.rotate_all(delta)
+        # Cached sentence rects are in PDF coordinates, which rotation changes.
+        self._sentence_rects_by_page.clear()
         # Wipe selection/search since coordinates changed.
         self._selected_words.clear()
         self._selected_rects_by_page.clear()
@@ -1267,6 +1384,9 @@ class PdfView(QGraphicsView):
             return
         item = self._page_items[page_index]
         if item is None:
+            # Explicit user-triggered refresh — always worth another attempt
+            # even if earlier renders of this page failed.
+            self._failed_renders.pop(page_index, None)
             self._ensure_page_rendered(page_index)
             return
         img = self.doc.render_page(page_index, zoom=self._zoom * self._render_scale)
