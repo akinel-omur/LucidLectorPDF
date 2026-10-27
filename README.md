@@ -147,6 +147,14 @@ LucidLectorPDF/
 
 ---
 
+## Development & continuing in another session
+
+Project brief for humans and AI assistants: [`AGENTS.md`](AGENTS.md). Living status and
+next steps: [`docs/HANDOFF.md`](docs/HANDOFF.md). New machine: `scripts\setup.ps1`.
+Save to GitHub: `scripts\sync.ps1 "message"`.
+
+---
+
 ## License
 
 This project is distributed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see [LICENSE](LICENSE).
