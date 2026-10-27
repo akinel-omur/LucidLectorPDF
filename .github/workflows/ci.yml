@@ -22,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
       - run: node web/tests/run-tests.mjs web/tests/sample.pdf
       - run: node web/tests/paragraph-tests.mjs
       - run: node web/tests/static-check.mjs
