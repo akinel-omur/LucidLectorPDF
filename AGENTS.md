@@ -33,7 +33,7 @@ web\start.bat                         # serves http://localhost:8000 (needs serv
 node web/tests/run-tests.mjs web/tests/sample.pdf
 node web/tests/paragraph-tests.mjs
 node web/tests/static-check.mjs
-node web/tests/matching-tests.mjs     # 2 known failures, see docs/HANDOFF.md
+node web/tests/matching-tests.mjs
 ```
 
 One-shot setup on a fresh machine: `scripts\setup.ps1`. Save work to GitHub: `scripts\sync.ps1`.

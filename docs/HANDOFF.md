@@ -30,17 +30,13 @@ GitHub login on a new machine: `git push` once and sign in via the browser promp
 - **Not yet ported to web:** highlight/underline annotations, undo/redo, saving annotated PDF,
   bookmarks panel, dual-page/split view, recent files.
 - Tests: pytest 37 pass; node `run-tests` 35, `paragraph-tests` 17, `static-check` clean.
-- **Known failing:** `web/tests/matching-tests.mjs` — 2 of 7 fail ("the highlight covers every
-  run of the match", "rectangles stay inside the runs they came from") with
-  `Cannot read properties of undefined (reading '0')`. Pre-existing; investigate before relying
-  on that suite. CI runs it as non-blocking until fixed.
+- All web test suites pass (matching-tests fixed 2026-10-28: the test fixture lacked `items`).
 
 ## Sıradaki işler (priority order)
 
 From `docs/KOD_DENETIMI.md` §7 (items 1–7 done):
 
-1. Fix the 2 failing `matching-tests.mjs` cases.
-2. Translation panel should follow the source panel in split view (needs `translate_requested`
+1. Translation panel should follow the source panel in split view (needs `translate_requested`
    to carry the source panel; signal signature change). Three inconsistent scenarios listed in
    KOD_DENETIMI §9 "Hâlâ açık".
 3. `PanelState` dataclass replacing four parallel dicts (§5).
@@ -73,5 +69,6 @@ From `docs/KOD_DENETIMI.md` §7 (items 1–7 done):
 
 ## Session log (newest first; one line each)
 
+- 2026-10-28 — Fixed matching-tests fixture; CI now gates on all web suites.
 - 2026-10-21 — Added AGENTS.md/CLAUDE.md, this file, scripts, CI; pushed pending local commits
   (bookmark panel, split view, lazy rendering) and the web port + tests.

@@ -36,11 +36,13 @@ const item = (str, x, w) => ({ str, hasEOL: false, x, y: 100, w, h: 10 });
 
 // "modified" set with an fi ligature: three runs, no spaces between them,
 // while the paragraph builder renders the same text as "modi fi ed".
-const ligature = buildSearchString([
+// Mirrors the viewer, which stores the runs next to the built strings.
+const ligatureItems = [
   item('The rhythmicity is controlled by neurons in the brainstem which can be modi', 50, 300),
   item('fi', 350, 6),
   item('ed by higher brain centers, and chemoreceptors in the carotid body.', 356, 260),
-]);
+];
+const ligature = { items: ligatureItems, ...buildSearchString(ligatureItems) };
 
 test('runs concatenate without an invented space', () => {
   assert.ok(ligature.text.includes('modified'));

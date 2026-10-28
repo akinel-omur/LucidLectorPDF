@@ -26,9 +26,7 @@ jobs:
       - run: node web/tests/run-tests.mjs web/tests/sample.pdf
       - run: node web/tests/paragraph-tests.mjs
       - run: node web/tests/static-check.mjs
-      - name: matching-tests (known failures, non-blocking)
-        run: node web/tests/matching-tests.mjs
-        continue-on-error: true
+      - run: node web/tests/matching-tests.mjs
       - name: dom-smoke
         run: |
           npm install jsdom --no-save
