@@ -39,14 +39,14 @@ From `docs/KOD_DENETIMI.md` §7 (items 1–7 done):
 1. Translation panel should follow the source panel in split view (needs `translate_requested`
    to carry the source panel; signal signature change). Three inconsistent scenarios listed in
    KOD_DENETIMI §9 "Hâlâ açık".
-3. `PanelState` dataclass replacing four parallel dicts (§5).
-4. UI language vs translation target language separation (§3).
-5. Ctrl+F freezes the UI on very large documents (twin of §1.3).
-6. Highlight export feature (§6).
-7. Smaller open items: §1.9 arrow keys hijack horizontal scroll, §1.11 `RecentFiles.list()`
+2. `PanelState` dataclass replacing four parallel dicts (§5).
+3. UI language vs translation target language separation (§3).
+4. Ctrl+F freezes the UI on very large documents (twin of §1.3).
+5. Highlight export feature (§6).
+6. Smaller open items: §1.9 arrow keys hijack horizontal scroll, §1.11 `RecentFiles.list()`
    hits disk on every menu open; `_sync_view_mode_actions` `blockSignals` caveat if those
    actions ever move to a toolbar.
-8. Web port: port annotations/undo/save, bookmarks, recent files (see list above).
+7. Web port: port annotations/undo/save, bookmarks, recent files (see list above).
 
 ## Decisions worth remembering
 
