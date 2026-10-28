@@ -48,7 +48,14 @@
 
 ## Screenshots
 
-> *Screenshots coming soon.*
+Web version (`web/`), opened on the bundled sample document:
+
+<p align="center">
+  <img src="docs/screenshots/web-reader.png" width="48%" alt="Web reader with translation panel"/>
+  <img src="docs/screenshots/web-search.png" width="48%" alt="Full-text search with highlights and paragraph badges"/>
+</p>
+
+> Desktop (PyQt6) screenshots are still to come.
 
 ---
 

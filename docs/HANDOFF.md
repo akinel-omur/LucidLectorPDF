@@ -69,6 +69,7 @@ From `docs/KOD_DENETIMI.md` §7 (items 1–7 done):
 
 ## Session log (newest first; one line each)
 
+- 2026-10-28 — Added web screenshots to README (docs/screenshots). Desktop screenshots still missing.
 - 2026-10-28 — Fixed matching-tests fixture; CI now gates on all web suites.
 - 2026-10-21 — Added AGENTS.md/CLAUDE.md, this file, scripts, CI; pushed pending local commits
   (bookmark panel, split view, lazy rendering) and the web port + tests.
